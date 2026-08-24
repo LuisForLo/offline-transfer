@@ -18,6 +18,7 @@ object SecureLinkHandshake {
     private const val CONNECT_TIMEOUT_MS = 2_000
     private const val CONNECT_ATTEMPTS = 15
     private const val CONNECT_RETRY_DELAY_MS = 300L
+    private const val RECEIVER_ACCEPT_TIMEOUT_MS = 7_000
 
     fun establishAsSender(
         host: String,
@@ -78,6 +79,7 @@ object SecureLinkHandshake {
         cancellation?.track(server)
         try {
             server.reuseAddress = true
+            server.soTimeout = RECEIVER_ACCEPT_TIMEOUT_MS
             server.bind(InetSocketAddress(port))
             val socket = server.accept()
             cancellation?.track(socket)
