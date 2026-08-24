@@ -1,3 +1,5 @@
+import java.util.Base64
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -10,7 +12,7 @@ val stableDevKeystore = rootProject.file("dev-signing/offline-transfer-dev.keyst
 if (!stableDevKeystore.exists() && stableDevKeyBase64.exists()) {
     stableDevSigningDir.mkdirs()
     stableDevKeystore.writeBytes(
-        java.util.Base64.getDecoder().decode(stableDevKeyBase64.readText().trim()),
+        Base64.getDecoder().decode(stableDevKeyBase64.readText().trim()),
     )
 }
 
