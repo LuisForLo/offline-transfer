@@ -4,7 +4,8 @@ import com.luisforlo.offlinetransfer.transfer.TransferCancellation
 
 /**
  * Process-local ephemeral security state. No session key or private key is persisted.
- * A new receiver key pair is generated after reset/disconnect.
+ * Receiver/sender ephemeral identities live only while this app process remains alive;
+ * the established traffic key is cleared whenever the Wi-Fi Direct link is disconnected.
  */
 object SecuritySessionStore {
     @Volatile
@@ -18,8 +19,7 @@ object SecuritySessionStore {
 
     @Synchronized
     fun prepareReceiver(): SecureSessionCrypto.ReceiverSession {
-        senderSession = null
-        establishedLink = null
+        clearEstablishedLink()
         return receiverSession ?: SecureSessionCrypto.createReceiverSession().also {
             receiverSession = it
         }
@@ -30,8 +30,7 @@ object SecuritySessionStore {
         sessionIdBase64: String,
         receiverPublicKeyBase64: String,
     ): SecureSessionCrypto.SenderSession {
-        receiverSession = null
-        establishedLink = null
+        clearEstablishedLink()
         return SecureSessionCrypto.createSenderSession(
             sessionIdBase64 = sessionIdBase64,
             receiverPublicKeyBase64 = receiverPublicKeyBase64,
@@ -84,10 +83,15 @@ object SecuritySessionStore {
     fun verificationCodeOrNull(): String? = establishedLink?.verificationCode
 
     @Synchronized
-    fun reset() {
+    fun clearEstablishedLink() {
         establishedLink?.sessionKey?.fill(0)
-        senderSession?.sessionKey?.fill(0)
         establishedLink = null
+    }
+
+    @Synchronized
+    fun resetAll() {
+        clearEstablishedLink()
+        senderSession?.sessionKey?.fill(0)
         senderSession = null
         receiverSession = null
     }
