@@ -5,13 +5,14 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import com.luisforlo.offlinetransfer.protocol.TransferHeader
 import java.io.File
 
 object AndroidFileTransfer {
-    private const val COPY_BUFFER_SIZE = 256 * 1024
+    private const val COPY_BUFFER_SIZE = 1024 * 1024
 
     data class FileInfo(
         val uri: Uri,
@@ -53,9 +54,11 @@ object AndroidFileTransfer {
         val info = inspect(context, uri)
         cancellation?.throwIfCancelled()
 
+        val hashStartedAt = SystemClock.elapsedRealtime()
         val sha256 = resolver.openInputStream(uri)?.use { input ->
             FileHasher.sha256(input, cancellation)
         } ?: error("No se pudo abrir el archivo seleccionado")
+        val hashElapsedMillis = (SystemClock.elapsedRealtime() - hashStartedAt).coerceAtLeast(1L)
 
         cancellation?.throwIfCancelled()
         val header = TransferHeader(
@@ -74,7 +77,7 @@ object AndroidFileTransfer {
             },
             cancellation = cancellation,
             onProgress = onProgress,
-        )
+        ).copy(preparationElapsedMillis = hashElapsedMillis)
     }
 
     fun receiveAndSave(
@@ -93,13 +96,20 @@ object AndroidFileTransfer {
             cancellation?.throwIfCancelled()
             check(result.verified) { "SHA-256 no coincide; el archivo recibido fue descartado" }
 
+            val publishStartedAt = SystemClock.elapsedRealtime()
             val location = publishVerifiedFile(
                 context = context,
                 source = temporary,
                 rawFileName = result.header.fileName,
                 mimeType = result.header.mimeType,
             )
-            return SavedResult(result, location)
+            val publishElapsedMillis =
+                (SystemClock.elapsedRealtime() - publishStartedAt).coerceAtLeast(1L)
+
+            return SavedResult(
+                transfer = result.copy(publishElapsedMillis = publishElapsedMillis),
+                location = location,
+            )
         } finally {
             temporary.delete()
         }
