@@ -33,10 +33,12 @@ object TcpFileTransfer {
         val effectiveReceiveBufferBytes: Int = 0,
         val encrypted: Boolean = false,
         val securityVerificationCode: String? = null,
+        val resumedFromBytes: Long = 0L,
+        val networkBytesTransferred: Long = bytesTransferred,
     ) {
         val bytesPerSecond: Double
             get() = if (transferElapsedMillis > 0L) {
-                bytesTransferred.toDouble() * 1_000.0 / transferElapsedMillis.toDouble()
+                networkBytesTransferred.toDouble() * 1_000.0 / transferElapsedMillis.toDouble()
             } else {
                 0.0
             }
@@ -98,6 +100,7 @@ object TcpFileTransfer {
                 transferElapsedMillis = elapsedMillis,
                 effectiveSendBufferBytes = effectiveSendBuffer,
                 effectiveReceiveBufferBytes = effectiveReceiveBuffer,
+                networkBytesTransferred = sent,
             )
         } catch (error: IOException) {
             if (cancellation?.isCancelled == true) throw TransferCancelledException()
@@ -201,6 +204,7 @@ object TcpFileTransfer {
             transferElapsedMillis = elapsedMillis,
             effectiveSendBufferBytes = effectiveSendBuffer,
             effectiveReceiveBufferBytes = effectiveReceiveBuffer,
+            networkBytesTransferred = received,
         )
     }
 
