@@ -39,13 +39,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.luisforlo.offlinetransfer.transfer.AndroidFileTransfer
+import com.luisforlo.offlinetransfer.transfer.TcpFileTransfer
 import com.luisforlo.offlinetransfer.transfer.TransferCancellation
 import com.luisforlo.offlinetransfer.transfer.TransferCancelledException
 import com.luisforlo.offlinetransfer.transfer.TransferMetricsCalculator
 import com.luisforlo.offlinetransfer.transport.wifidirect.WifiDirectManager
 import com.luisforlo.offlinetransfer.ui.theme.OfflineTransferTheme
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -86,6 +86,7 @@ private data class TransferUiState(
     val fileCount: Int = 0,
     val speedBytesPerSecond: Double = 0.0,
     val etaSeconds: Long? = null,
+    val diagnostics: String? = null,
 )
 
 private data class TransferHistoryEntry(
@@ -105,7 +106,6 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     var permissionGranted by remember { mutableStateOf(hasNearbyPermission()) }
     var transferUi by remember { mutableStateOf(TransferUiState()) }
     var transferCancellation by remember { mutableStateOf<TransferCancellation?>(null) }
-    var transferJob by remember { mutableStateOf<Job?>(null) }
     var history by remember { mutableStateOf<List<TransferHistoryEntry>>(emptyList()) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -150,7 +150,8 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     fun startReceiveSession() {
         val cancellation = TransferCancellation()
         transferCancellation = cancellation
-        transferJob = scope.launch {
+
+        scope.launch {
             var receivedCount = 0
             try {
                 while (!cancellation.isCancelled) {
@@ -173,7 +174,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                         ) { received, total ->
                             val now = SystemClock.elapsedRealtime()
                             if (networkStartMillis == 0L) networkStartMillis = now
-                            if (now - lastUiUpdate >= 100L || received == total) {
+                            if (now - lastUiUpdate >= 150L || received == total) {
                                 lastUiUpdate = now
                                 val metrics = TransferMetricsCalculator.calculate(
                                     bytesDone = received,
@@ -196,13 +197,18 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                     }
 
                     receivedCount++
+                    val diagnostics = formatPerformance(
+                        result = saved.transfer,
+                        showPreparation = false,
+                        showPublish = true,
+                    )
                     history = listOf(
                         TransferHistoryEntry(
                             id = System.nanoTime(),
                             direction = "RECIBIDO",
                             fileName = saved.transfer.header.fileName,
                             sizeBytes = saved.transfer.bytesTransferred,
-                            detail = saved.location,
+                            detail = "$diagnostics\n${saved.location}",
                         ),
                     ) + history
 
@@ -213,6 +219,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                         bytesTotal = saved.transfer.header.sizeBytes,
                         currentFile = saved.transfer.header.fileName,
                         fileIndex = receivedCount + 1,
+                        diagnostics = diagnostics,
                     )
                 }
             } catch (_: TransferCancelledException) {
@@ -231,7 +238,6 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                 )
             } finally {
                 transferCancellation = null
-                transferJob = null
             }
         }
     }
@@ -239,7 +245,8 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     fun sendFiles(uris: List<Uri>, host: String) {
         val cancellation = TransferCancellation()
         transferCancellation = cancellation
-        transferJob = scope.launch {
+
+        scope.launch {
             try {
                 transferUi = TransferUiState(
                     phase = TransferPhase.PREPARING,
@@ -255,6 +262,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                 }
                 val totalBatchBytes = files.sumOf { it.sizeBytes }
                 var completedBytes = 0L
+                var lastDiagnostics: String? = null
 
                 files.forEachIndexed { index, file ->
                     cancellation.throwIfCancelled()
@@ -279,7 +287,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                         ) { sent, fileTotal ->
                             val now = SystemClock.elapsedRealtime()
                             if (networkStartMillis == 0L) networkStartMillis = now
-                            if (now - lastUiUpdate >= 100L || sent == fileTotal) {
+                            if (now - lastUiUpdate >= 150L || sent == fileTotal) {
                                 lastUiUpdate = now
                                 val metrics = TransferMetricsCalculator.calculate(
                                     bytesDone = sent,
@@ -317,13 +325,18 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
 
                     check(result.verified) { "El receptor detectó que SHA-256 no coincide" }
                     completedBytes += file.sizeBytes
+                    lastDiagnostics = formatPerformance(
+                        result = result,
+                        showPreparation = true,
+                        showPublish = false,
+                    )
                     history = listOf(
                         TransferHistoryEntry(
                             id = System.nanoTime(),
                             direction = "ENVIADO",
                             fileName = result.header.fileName,
                             sizeBytes = result.bytesTransferred,
-                            detail = "SHA-256 verificado por el receptor",
+                            detail = "SHA-256 verificado · $lastDiagnostics",
                         ),
                     ) + history
                 }
@@ -335,6 +348,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                     bytesTotal = totalBatchBytes,
                     fileIndex = files.size,
                     fileCount = files.size,
+                    diagnostics = lastDiagnostics,
                 )
             } catch (_: TransferCancelledException) {
                 transferUi = TransferUiState(
@@ -348,7 +362,6 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                 )
             } finally {
                 transferCancellation = null
-                transferJob = null
             }
         }
     }
@@ -363,7 +376,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("0.3.0-dev · Wi-Fi Direct + lotes + métricas + SHA-256")
+                Text("0.3.1-dev · Wi-Fi Direct + buffers optimizados + diagnóstico")
             }
 
             item {
@@ -386,6 +399,10 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                 style = MaterialTheme.typography.titleMedium,
                             )
                             Text("Host del grupo: ${state.groupOwnerAddress ?: "—"}")
+                            Text(
+                                "Perfil TCP: chunks 1 MiB · buffer solicitado 4 MiB",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
 
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -467,10 +484,6 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                     Text("Cancelar envío")
                                 }
                             }
-                            Text(
-                                "El receptor debe iniciar una sesión. Puedes seleccionar fotos, videos, documentos o cualquier combinación.",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
                         }
                     }
                 }
@@ -523,10 +536,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                     style = MaterialTheme.typography.bodySmall,
                                 )
                             } else if (transferUi.fileIndex > 0 && state.isGroupOwner) {
-                                Text(
-                                    "Archivo #${transferUi.fileIndex}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
+                                Text("Archivo #${transferUi.fileIndex}", style = MaterialTheme.typography.bodySmall)
                             }
 
                             if (transferUi.bytesTotal > 0L) {
@@ -547,10 +557,15 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
 
                             if (transferUi.speedBytesPerSecond > 0.0) {
                                 Text(
-                                    "${formatBytes(transferUi.speedBytesPerSecond.toLong())}/s" +
+                                    "${formatRate(transferUi.speedBytesPerSecond)}" +
                                         (transferUi.etaSeconds?.let { " · ${formatEta(it)} restantes" } ?: ""),
                                     style = MaterialTheme.typography.titleMedium,
                                 )
+                            }
+
+                            transferUi.diagnostics?.let { diagnostics ->
+                                Text("Diagnóstico", style = MaterialTheme.typography.titleSmall)
+                                Text(diagnostics, style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
@@ -585,6 +600,31 @@ private fun ComponentActivity.requiredNearbyPermission(): String =
 private fun ComponentActivity.hasNearbyPermission(): Boolean =
     ContextCompat.checkSelfPermission(this, requiredNearbyPermission()) == PackageManager.PERMISSION_GRANTED
 
+private fun formatPerformance(
+    result: TcpFileTransfer.Result,
+    showPreparation: Boolean,
+    showPublish: Boolean,
+): String {
+    val parts = mutableListOf<String>()
+    parts += "Red ${formatRate(result.bytesPerSecond)} en ${formatDurationMs(result.transferElapsedMillis)}"
+
+    if (showPreparation && result.preparationElapsedMillis > 0L) {
+        val hashRate = result.bytesTransferred.toDouble() * 1_000.0 / result.preparationElapsedMillis.toDouble()
+        parts += "SHA-256 ${formatRate(hashRate)} en ${formatDurationMs(result.preparationElapsedMillis)}"
+    }
+
+    if (showPublish && result.publishElapsedMillis > 0L) {
+        val publishRate = result.bytesTransferred.toDouble() * 1_000.0 / result.publishElapsedMillis.toDouble()
+        parts += "Guardado ${formatRate(publishRate)} en ${formatDurationMs(result.publishElapsedMillis)}"
+    }
+
+    if (result.effectiveSendBufferBytes > 0 || result.effectiveReceiveBufferBytes > 0) {
+        parts += "TCP send ${formatBytes(result.effectiveSendBufferBytes.toLong())} · recv ${formatBytes(result.effectiveReceiveBufferBytes.toLong())}"
+    }
+
+    return parts.joinToString("\n")
+}
+
 private fun formatBytes(bytes: Long): String {
     if (bytes < 1024L) return "$bytes B"
 
@@ -596,6 +636,14 @@ private fun formatBytes(bytes: Long): String {
         unitIndex++
     }
     return String.format(Locale.getDefault(), "%.1f %s", value, units[unitIndex])
+}
+
+private fun formatRate(bytesPerSecond: Double): String =
+    "${formatBytes(bytesPerSecond.coerceAtLeast(0.0).toLong())}/s"
+
+private fun formatDurationMs(milliseconds: Long): String = when {
+    milliseconds < 1_000L -> "${milliseconds} ms"
+    else -> String.format(Locale.getDefault(), "%.2f s", milliseconds / 1_000.0)
 }
 
 private fun formatEta(seconds: Long): String {
