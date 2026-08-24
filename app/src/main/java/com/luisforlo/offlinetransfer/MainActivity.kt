@@ -1,6 +1,7 @@
 package com.luisforlo.offlinetransfer
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -38,12 +39,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.luisforlo.offlinetransfer.transfer.AndroidFileTransfer
+import com.luisforlo.offlinetransfer.transfer.TransferCancellation
+import com.luisforlo.offlinetransfer.transfer.TransferCancelledException
+import com.luisforlo.offlinetransfer.transfer.TransferMetricsCalculator
 import com.luisforlo.offlinetransfer.transport.wifidirect.WifiDirectManager
 import com.luisforlo.offlinetransfer.ui.theme.OfflineTransferTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
+import kotlin.math.ceil
 
 class MainActivity : ComponentActivity() {
     private lateinit var wifiDirect: WifiDirectManager
@@ -66,6 +72,7 @@ private enum class TransferPhase {
     WAITING,
     TRANSFERRING,
     COMPLETE,
+    CANCELLED,
     ERROR,
 }
 
@@ -74,6 +81,19 @@ private data class TransferUiState(
     val message: String = "Sin transferencia activa",
     val bytesDone: Long = 0L,
     val bytesTotal: Long = 0L,
+    val currentFile: String? = null,
+    val fileIndex: Int = 0,
+    val fileCount: Int = 0,
+    val speedBytesPerSecond: Double = 0.0,
+    val etaSeconds: Long? = null,
+)
+
+private data class TransferHistoryEntry(
+    val id: Long,
+    val direction: String,
+    val fileName: String,
+    val sizeBytes: Long,
+    val detail: String,
 )
 
 @Composable
@@ -81,23 +101,26 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     val activity = this
     val scope = rememberCoroutineScope()
     val state by wifiDirect.state.collectAsState()
-    var selectedFile by remember { mutableStateOf<Uri?>(null) }
+    var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var permissionGranted by remember { mutableStateOf(hasNearbyPermission()) }
     var transferUi by remember { mutableStateOf(TransferUiState()) }
+    var transferCancellation by remember { mutableStateOf<TransferCancellation?>(null) }
+    var transferJob by remember { mutableStateOf<Job?>(null) }
+    var history by remember { mutableStateOf<List<TransferHistoryEntry>>(emptyList()) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> permissionGranted = granted }
 
     val filePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        selectedFile = uri
-        if (uri != null) {
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        selectedFiles = uris
+        uris.forEach { uri ->
             runCatching {
                 contentResolver.takePersistableUriPermission(
                     uri,
-                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
                 )
             }
         }
@@ -105,7 +128,10 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
 
     DisposableEffect(Unit) {
         wifiDirect.register()
-        onDispose { wifiDirect.unregister() }
+        onDispose {
+            transferCancellation?.cancel()
+            wifiDirect.unregister()
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -116,92 +142,213 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         transferUi.phase == TransferPhase.WAITING ||
         transferUi.phase == TransferPhase.TRANSFERRING
 
-    fun receiveFile() {
-        scope.launch {
-            transferUi = TransferUiState(
-                phase = TransferPhase.WAITING,
-                message = "Esperando al teléfono emisor…",
-            )
+    fun stopTransfer() {
+        transferUi = transferUi.copy(message = "Cancelando transferencia…")
+        transferCancellation?.cancel()
+    }
+
+    fun startReceiveSession() {
+        val cancellation = TransferCancellation()
+        transferCancellation = cancellation
+        transferJob = scope.launch {
+            var receivedCount = 0
             try {
-                val saved = withContext(Dispatchers.IO) {
+                while (!cancellation.isCancelled) {
+                    transferUi = TransferUiState(
+                        phase = TransferPhase.WAITING,
+                        message = if (receivedCount == 0) {
+                            "Receptor listo. Esperando archivos…"
+                        } else {
+                            "✓ $receivedCount archivo(s) recibido(s). Esperando el siguiente…"
+                        },
+                        fileIndex = receivedCount + 1,
+                    )
+
+                    var networkStartMillis = 0L
                     var lastUiUpdate = 0L
-                    AndroidFileTransfer.receiveAndSave(activity) { received, total ->
-                        val now = SystemClock.elapsedRealtime()
-                        if (now - lastUiUpdate >= 100L || received == total) {
-                            lastUiUpdate = now
-                            activity.runOnUiThread {
-                                transferUi = TransferUiState(
-                                    phase = TransferPhase.TRANSFERRING,
-                                    message = "Recibiendo archivo…",
+                    val saved = withContext(Dispatchers.IO) {
+                        AndroidFileTransfer.receiveAndSave(
+                            context = activity,
+                            cancellation = cancellation,
+                        ) { received, total ->
+                            val now = SystemClock.elapsedRealtime()
+                            if (networkStartMillis == 0L) networkStartMillis = now
+                            if (now - lastUiUpdate >= 100L || received == total) {
+                                lastUiUpdate = now
+                                val metrics = TransferMetricsCalculator.calculate(
                                     bytesDone = received,
                                     bytesTotal = total,
+                                    elapsedMillis = (now - networkStartMillis).coerceAtLeast(1L),
                                 )
+                                activity.runOnUiThread {
+                                    transferUi = TransferUiState(
+                                        phase = TransferPhase.TRANSFERRING,
+                                        message = "Recibiendo archivo…",
+                                        bytesDone = received,
+                                        bytesTotal = total,
+                                        fileIndex = receivedCount + 1,
+                                        speedBytesPerSecond = metrics.bytesPerSecond,
+                                        etaSeconds = metrics.etaSeconds,
+                                    )
+                                }
                             }
                         }
                     }
+
+                    receivedCount++
+                    history = listOf(
+                        TransferHistoryEntry(
+                            id = System.nanoTime(),
+                            direction = "RECIBIDO",
+                            fileName = saved.transfer.header.fileName,
+                            sizeBytes = saved.transfer.bytesTransferred,
+                            detail = saved.location,
+                        ),
+                    ) + history
+
+                    transferUi = TransferUiState(
+                        phase = TransferPhase.WAITING,
+                        message = "✓ ${saved.transfer.header.fileName} verificado. Esperando otro archivo…",
+                        bytesDone = saved.transfer.bytesTransferred,
+                        bytesTotal = saved.transfer.header.sizeBytes,
+                        currentFile = saved.transfer.header.fileName,
+                        fileIndex = receivedCount + 1,
+                    )
                 }
+            } catch (_: TransferCancelledException) {
                 transferUi = TransferUiState(
-                    phase = TransferPhase.COMPLETE,
-                    message = "✓ Archivo verificado y guardado en ${saved.location}",
-                    bytesDone = saved.transfer.bytesTransferred,
-                    bytesTotal = saved.transfer.header.sizeBytes,
+                    phase = TransferPhase.CANCELLED,
+                    message = if (receivedCount > 0) {
+                        "Sesión finalizada. $receivedCount archivo(s) recibido(s) correctamente."
+                    } else {
+                        "Recepción detenida."
+                    },
                 )
             } catch (error: Throwable) {
                 transferUi = TransferUiState(
                     phase = TransferPhase.ERROR,
                     message = "Error al recibir: ${error.message ?: error.javaClass.simpleName}",
                 )
+            } finally {
+                transferCancellation = null
+                transferJob = null
             }
         }
     }
 
-    fun sendFile(uri: Uri, host: String) {
-        scope.launch {
-            transferUi = TransferUiState(
-                phase = TransferPhase.PREPARING,
-                message = "Calculando SHA-256 y preparando archivo…",
-            )
+    fun sendFiles(uris: List<Uri>, host: String) {
+        val cancellation = TransferCancellation()
+        transferCancellation = cancellation
+        transferJob = scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) {
+                transferUi = TransferUiState(
+                    phase = TransferPhase.PREPARING,
+                    message = "Leyendo información de ${uris.size} archivo(s)…",
+                    fileCount = uris.size,
+                )
+
+                val files = withContext(Dispatchers.IO) {
+                    uris.map { uri ->
+                        cancellation.throwIfCancelled()
+                        AndroidFileTransfer.inspect(activity, uri)
+                    }
+                }
+                val totalBatchBytes = files.sumOf { it.sizeBytes }
+                var completedBytes = 0L
+
+                files.forEachIndexed { index, file ->
+                    cancellation.throwIfCancelled()
+                    transferUi = TransferUiState(
+                        phase = TransferPhase.PREPARING,
+                        message = "Calculando SHA-256 de ${file.fileName}…",
+                        bytesDone = completedBytes,
+                        bytesTotal = totalBatchBytes,
+                        currentFile = file.fileName,
+                        fileIndex = index + 1,
+                        fileCount = files.size,
+                    )
+
+                    var networkStartMillis = 0L
                     var lastUiUpdate = 0L
-                    AndroidFileTransfer.send(activity, uri, host) { sent, total ->
-                        val now = SystemClock.elapsedRealtime()
-                        if (now - lastUiUpdate >= 100L || sent == total) {
-                            lastUiUpdate = now
-                            activity.runOnUiThread {
-                                transferUi = TransferUiState(
-                                    phase = TransferPhase.TRANSFERRING,
-                                    message = if (sent == total) {
-                                        "Archivo enviado; esperando verificación del receptor…"
-                                    } else {
-                                        "Enviando archivo…"
-                                    },
+                    val result = withContext(Dispatchers.IO) {
+                        AndroidFileTransfer.send(
+                            context = activity,
+                            uri = file.uri,
+                            host = host,
+                            cancellation = cancellation,
+                        ) { sent, fileTotal ->
+                            val now = SystemClock.elapsedRealtime()
+                            if (networkStartMillis == 0L) networkStartMillis = now
+                            if (now - lastUiUpdate >= 100L || sent == fileTotal) {
+                                lastUiUpdate = now
+                                val metrics = TransferMetricsCalculator.calculate(
                                     bytesDone = sent,
-                                    bytesTotal = total,
+                                    bytesTotal = fileTotal,
+                                    elapsedMillis = (now - networkStartMillis).coerceAtLeast(1L),
                                 )
+                                val batchDone = completedBytes + sent
+                                val remainingBatch = (totalBatchBytes - batchDone).coerceAtLeast(0L)
+                                val batchEta = if (metrics.bytesPerSecond > 0.0) {
+                                    ceil(remainingBatch / metrics.bytesPerSecond).toLong()
+                                } else {
+                                    null
+                                }
+
+                                activity.runOnUiThread {
+                                    transferUi = TransferUiState(
+                                        phase = TransferPhase.TRANSFERRING,
+                                        message = if (sent == fileTotal) {
+                                            "Archivo enviado; esperando verificación SHA-256…"
+                                        } else {
+                                            "Enviando ${file.fileName}…"
+                                        },
+                                        bytesDone = batchDone,
+                                        bytesTotal = totalBatchBytes,
+                                        currentFile = file.fileName,
+                                        fileIndex = index + 1,
+                                        fileCount = files.size,
+                                        speedBytesPerSecond = metrics.bytesPerSecond,
+                                        etaSeconds = batchEta,
+                                    )
+                                }
                             }
                         }
                     }
+
+                    check(result.verified) { "El receptor detectó que SHA-256 no coincide" }
+                    completedBytes += file.sizeBytes
+                    history = listOf(
+                        TransferHistoryEntry(
+                            id = System.nanoTime(),
+                            direction = "ENVIADO",
+                            fileName = result.header.fileName,
+                            sizeBytes = result.bytesTransferred,
+                            detail = "SHA-256 verificado por el receptor",
+                        ),
+                    ) + history
                 }
 
-                transferUi = if (result.verified) {
-                    TransferUiState(
-                        phase = TransferPhase.COMPLETE,
-                        message = "✓ Transferencia completa. El receptor confirmó SHA-256.",
-                        bytesDone = result.bytesTransferred,
-                        bytesTotal = result.header.sizeBytes,
-                    )
-                } else {
-                    TransferUiState(
-                        phase = TransferPhase.ERROR,
-                        message = "El receptor detectó que SHA-256 no coincide.",
-                    )
-                }
+                transferUi = TransferUiState(
+                    phase = TransferPhase.COMPLETE,
+                    message = "✓ ${files.size} archivo(s) transferido(s) y verificado(s).",
+                    bytesDone = totalBatchBytes,
+                    bytesTotal = totalBatchBytes,
+                    fileIndex = files.size,
+                    fileCount = files.size,
+                )
+            } catch (_: TransferCancelledException) {
+                transferUi = TransferUiState(
+                    phase = TransferPhase.CANCELLED,
+                    message = "Envío cancelado.",
+                )
             } catch (error: Throwable) {
                 transferUi = TransferUiState(
                     phase = TransferPhase.ERROR,
                     message = "Error al enviar: ${error.message ?: error.javaClass.simpleName}",
                 )
+            } finally {
+                transferCancellation = null
+                transferJob = null
             }
         }
     }
@@ -216,7 +363,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("MVP 1 · Wi-Fi Direct + OTF1 + TCP + SHA-256")
+                Text("0.3.0-dev · Wi-Fi Direct + lotes + métricas + SHA-256")
             }
 
             item {
@@ -232,9 +379,9 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                         if (state.connected) {
                             Text(
                                 if (state.isGroupOwner) {
-                                    "MODO RECEPTOR · este teléfono recibirá el archivo"
+                                    "MODO RECEPTOR · recepción continua"
                                 } else {
-                                    "MODO EMISOR · este teléfono enviará el archivo"
+                                    "MODO EMISOR · uno o varios archivos"
                                 },
                                 style = MaterialTheme.typography.titleMedium,
                             )
@@ -290,28 +437,38 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             Modifier.padding(16.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
-                            Text("Enviar archivo", style = MaterialTheme.typography.titleMedium)
-                            Text(selectedFile?.lastPathSegment ?: "Ningún archivo seleccionado")
+                            Text("Enviar archivos", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                when (selectedFiles.size) {
+                                    0 -> "Ningún archivo seleccionado"
+                                    1 -> "1 archivo seleccionado"
+                                    else -> "${selectedFiles.size} archivos seleccionados"
+                                },
+                            )
                             OutlinedButton(
                                 enabled = !transferBusy,
                                 onClick = { filePicker.launch(arrayOf("*/*")) },
                             ) {
-                                Text("Seleccionar archivo")
+                                Text("Seleccionar archivos")
                             }
                             Button(
-                                enabled = selectedFile != null &&
+                                enabled = selectedFiles.isNotEmpty() &&
                                     state.groupOwnerAddress != null &&
                                     !transferBusy,
                                 onClick = {
-                                    val uri = selectedFile
                                     val host = state.groupOwnerAddress
-                                    if (uri != null && host != null) sendFile(uri, host)
+                                    if (host != null) sendFiles(selectedFiles, host)
                                 },
                             ) {
                                 Text("Enviar ahora")
                             }
+                            if (transferBusy) {
+                                OutlinedButton(onClick = { stopTransfer() }) {
+                                    Text("Cancelar envío")
+                                }
+                            }
                             Text(
-                                "En el teléfono receptor pulsa primero “Preparar recepción” y luego envía desde aquí.",
+                                "El receptor debe iniciar una sesión. Puedes seleccionar fotos, videos, documentos o cualquier combinación.",
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -326,14 +483,21 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             Modifier.padding(16.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
-                            Text("Recibir archivo", style = MaterialTheme.typography.titleMedium)
-                            Text("Los archivos verificados se guardarán en Descargas/Offline Transfer.")
-                            Button(
-                                enabled = !transferBusy,
-                                onClick = { receiveFile() },
-                            ) {
-                                Text(if (transferUi.phase == TransferPhase.COMPLETE) "Recibir otro archivo" else "Preparar recepción")
+                            Text("Recibir archivos", style = MaterialTheme.typography.titleMedium)
+                            Text("La sesión queda escuchando para recibir varios archivos consecutivos.")
+                            if (transferBusy) {
+                                OutlinedButton(onClick = { stopTransfer() }) {
+                                    Text("Detener recepción")
+                                }
+                            } else {
+                                Button(onClick = { startReceiveSession() }) {
+                                    Text("Iniciar recepción")
+                                }
                             }
+                            Text(
+                                "Los archivos verificados se guardan en Descargas/Offline Transfer.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
                     }
                 }
@@ -348,6 +512,22 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                         ) {
                             Text("Transferencia", style = MaterialTheme.typography.titleMedium)
                             Text(transferUi.message)
+
+                            transferUi.currentFile?.let { fileName ->
+                                Text(fileName, style = MaterialTheme.typography.bodyMedium)
+                            }
+
+                            if (transferUi.fileCount > 0) {
+                                Text(
+                                    "Archivo ${transferUi.fileIndex.coerceAtMost(transferUi.fileCount)} de ${transferUi.fileCount}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            } else if (transferUi.fileIndex > 0 && state.isGroupOwner) {
+                                Text(
+                                    "Archivo #${transferUi.fileIndex}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
 
                             if (transferUi.bytesTotal > 0L) {
                                 val progress = (
@@ -364,6 +544,32 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             } else if (transferBusy) {
                                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                             }
+
+                            if (transferUi.speedBytesPerSecond > 0.0) {
+                                Text(
+                                    "${formatBytes(transferUi.speedBytesPerSecond.toLong())}/s" +
+                                        (transferUi.etaSeconds?.let { " · ${formatEta(it)} restantes" } ?: ""),
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (history.isNotEmpty()) {
+                item {
+                    Text("Historial de esta sesión", style = MaterialTheme.typography.titleMedium)
+                }
+                items(history.take(12), key = { it.id }) { entry ->
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("${entry.direction} · ${entry.fileName}")
+                            Text(formatBytes(entry.sizeBytes), style = MaterialTheme.typography.bodySmall)
+                            Text(entry.detail, style = MaterialTheme.typography.bodySmall)
                         }
                     }
                 }
@@ -390,4 +596,13 @@ private fun formatBytes(bytes: Long): String {
         unitIndex++
     }
     return String.format(Locale.getDefault(), "%.1f %s", value, units[unitIndex])
+}
+
+private fun formatEta(seconds: Long): String {
+    val safeSeconds = seconds.coerceAtLeast(0L)
+    return when {
+        safeSeconds < 60L -> "${safeSeconds}s"
+        safeSeconds < 3_600L -> "${safeSeconds / 60}m ${safeSeconds % 60}s"
+        else -> "${safeSeconds / 3_600}h ${(safeSeconds % 3_600) / 60}m"
+    }
 }
