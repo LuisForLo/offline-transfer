@@ -9,6 +9,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
@@ -20,12 +21,17 @@ import java.util.concurrent.TimeUnit
 object SecureTcpFileTransfer {
     const val DEFAULT_PORT = TcpFileTransfer.DEFAULT_PORT
     private const val MAGIC = 0x4F545332 // "OTS2"
-    private const val VERSION = 1
+    private const val VERSION = 2
     private const val CONNECT_TIMEOUT_MS = 2_000
     private const val CONNECT_ATTEMPTS = 15
     private const val CONNECT_RETRY_DELAY_MS = 300L
     private const val MAX_HEADER_PLAINTEXT = 64 * 1024
     private const val MAX_CIPHERTEXT_FRAME = TcpFileTransfer.STREAM_BUFFER_SIZE + 64
+
+    data class ReceiveResult(
+        val transfer: TcpFileTransfer.Result,
+        val destination: File,
+    )
 
     fun send(
         host: String,
@@ -46,7 +52,7 @@ object SecureTcpFileTransfer {
             val output = DataOutputStream(
                 BufferedOutputStream(socket.getOutputStream(), TcpFileTransfer.STREAM_BUFFER_SIZE),
             )
-            val acknowledgement = DataInputStream(
+            val input = DataInputStream(
                 BufferedInputStream(socket.getInputStream(), 64 * 1024),
             )
             val noncePrefix = SecureSessionCrypto.newNoncePrefix()
@@ -66,16 +72,35 @@ object SecureTcpFileTransfer {
                 plaintext = headerBytes,
                 length = headerBytes.size,
             )
+            output.flush()
 
-            var sent = 0L
+            val resumeOffset = input.readLong()
+            require(resumeOffset in 0..header.sizeBytes) { "Invalid resume offset" }
+            val resumeProof = readBytes(input, 128)
+            val expectedResumeProof = SecureSessionCrypto.resumeMac(
+                sessionKey = link.sessionKey,
+                sessionId = link.sessionId,
+                sha256 = header.sha256,
+                sizeBytes = header.sizeBytes,
+                resumeOffset = resumeOffset,
+            )
+            require(SecureSessionCrypto.constantTimeEquals(resumeProof, expectedResumeProof)) {
+                "Resume offset authentication failed"
+            }
+
+            onProgress(resumeOffset, header.sizeBytes)
+            var filePosition = resumeOffset
+            var sentThisConnection = 0L
             var counter = 1
+
             inputFactory().use { rawInput ->
-                BufferedInputStream(rawInput, TcpFileTransfer.STREAM_BUFFER_SIZE).use { input ->
+                BufferedInputStream(rawInput, TcpFileTransfer.STREAM_BUFFER_SIZE).use { fileInput ->
+                    skipExactly(fileInput, resumeOffset, cancellation)
                     val buffer = ByteArray(TcpFileTransfer.STREAM_BUFFER_SIZE)
-                    while (sent < header.sizeBytes) {
+                    while (filePosition < header.sizeBytes) {
                         cancellation?.throwIfCancelled()
-                        val maxRead = minOf(buffer.size.toLong(), header.sizeBytes - sent).toInt()
-                        val read = input.read(buffer, 0, maxRead)
+                        val maxRead = minOf(buffer.size.toLong(), header.sizeBytes - filePosition).toInt()
+                        val read = fileInput.read(buffer, 0, maxRead)
                         check(read >= 0) { "Source ended before declared file size" }
                         if (read == 0) continue
                         writeEncryptedFrame(
@@ -86,16 +111,17 @@ object SecureTcpFileTransfer {
                             plaintext = buffer,
                             length = read,
                         )
-                        sent += read
-                        onProgress(sent, header.sizeBytes)
+                        filePosition += read
+                        sentThisConnection += read
+                        onProgress(filePosition, header.sizeBytes)
                     }
                 }
             }
             output.flush()
             cancellation?.throwIfCancelled()
 
-            val verified = acknowledgement.readBoolean()
-            val ackMac = readBytes(acknowledgement, 128)
+            val verified = input.readBoolean()
+            val ackMac = readBytes(input, 128)
             val expectedMac = SecureSessionCrypto.acknowledgementMac(
                 sessionKey = link.sessionKey,
                 sessionId = link.sessionId,
@@ -109,13 +135,15 @@ object SecureTcpFileTransfer {
 
             return TcpFileTransfer.Result(
                 header = header,
-                bytesTransferred = sent,
+                bytesTransferred = header.sizeBytes,
                 verified = verified,
                 transferElapsedMillis = elapsedMillis,
                 effectiveSendBufferBytes = effectiveSendBuffer,
                 effectiveReceiveBufferBytes = effectiveReceiveBuffer,
                 encrypted = true,
                 securityVerificationCode = link.verificationCode,
+                resumedFromBytes = resumeOffset,
+                networkBytesTransferred = sentThisConnection,
             )
         } catch (error: IOException) {
             if (cancellation?.isCancelled == true) throw TransferCancelledException()
@@ -132,7 +160,38 @@ object SecureTcpFileTransfer {
         port: Int = DEFAULT_PORT,
         cancellation: TransferCancellation? = null,
         onProgress: (received: Long, total: Long) -> Unit = { _, _ -> },
-    ): TcpFileTransfer.Result {
+    ): TcpFileTransfer.Result = receiveInternal(
+        link = link,
+        port = port,
+        cancellation = cancellation,
+        onProgress = onProgress,
+        allowResume = false,
+        destinationFor = { destination },
+    ).transfer
+
+    fun receiveResumable(
+        link: SecureSessionCrypto.SecureLink,
+        destinationFor: (TransferHeader) -> File,
+        port: Int = DEFAULT_PORT,
+        cancellation: TransferCancellation? = null,
+        onProgress: (received: Long, total: Long) -> Unit = { _, _ -> },
+    ): ReceiveResult = receiveInternal(
+        link = link,
+        port = port,
+        cancellation = cancellation,
+        onProgress = onProgress,
+        allowResume = true,
+        destinationFor = destinationFor,
+    )
+
+    private fun receiveInternal(
+        link: SecureSessionCrypto.SecureLink,
+        port: Int,
+        cancellation: TransferCancellation?,
+        onProgress: (received: Long, total: Long) -> Unit,
+        allowResume: Boolean,
+        destinationFor: (TransferHeader) -> File,
+    ): ReceiveResult {
         cancellation?.throwIfCancelled()
         val server = ServerSocket()
         cancellation?.track(server)
@@ -145,7 +204,14 @@ object SecureTcpFileTransfer {
             cancellation?.track(socket)
             try {
                 configureSocket(socket)
-                return receiveFromSocket(socket, destination, link, cancellation, onProgress)
+                return receiveFromSocket(
+                    socket = socket,
+                    link = link,
+                    cancellation = cancellation,
+                    onProgress = onProgress,
+                    allowResume = allowResume,
+                    destinationFor = destinationFor,
+                )
             } finally {
                 cancellation?.untrack(socket)
                 runCatching { socket.close() }
@@ -161,17 +227,18 @@ object SecureTcpFileTransfer {
 
     private fun receiveFromSocket(
         socket: Socket,
-        destination: File,
         link: SecureSessionCrypto.SecureLink,
         cancellation: TransferCancellation?,
         onProgress: (received: Long, total: Long) -> Unit,
-    ): TcpFileTransfer.Result {
+        allowResume: Boolean,
+        destinationFor: (TransferHeader) -> File,
+    ): ReceiveResult {
         val effectiveSendBuffer = socket.sendBufferSize
         val effectiveReceiveBuffer = socket.receiveBufferSize
         val input = DataInputStream(
             BufferedInputStream(socket.getInputStream(), TcpFileTransfer.STREAM_BUFFER_SIZE),
         )
-        val acknowledgement = DataOutputStream(
+        val output = DataOutputStream(
             BufferedOutputStream(socket.getOutputStream(), 64 * 1024),
         )
         val startedAt = System.nanoTime()
@@ -199,13 +266,37 @@ object SecureTcpFileTransfer {
         require(header.sizeBytes >= 0) { "Invalid file size" }
         require(header.sizeBytes <= 1L shl 50) { "Refusing implausibly large transfer" }
 
+        val destination = destinationFor(header)
         destination.parentFile?.mkdirs()
-        val digest = MessageDigest.getInstance("SHA-256")
-        var received = 0L
+        if (!allowResume && destination.exists()) destination.delete()
+        if (destination.exists() && destination.length() > header.sizeBytes) destination.delete()
+
+        val resumeOffset = if (allowResume && destination.exists()) {
+            destination.length().coerceIn(0L, header.sizeBytes)
+        } else {
+            0L
+        }
+
+        output.writeLong(resumeOffset)
+        writeBytes(
+            output,
+            SecureSessionCrypto.resumeMac(
+                sessionKey = link.sessionKey,
+                sessionId = link.sessionId,
+                sha256 = header.sha256,
+                sizeBytes = header.sizeBytes,
+                resumeOffset = resumeOffset,
+            ),
+        )
+        output.flush()
+        onProgress(resumeOffset, header.sizeBytes)
+
+        var received = resumeOffset
+        var networkReceived = 0L
         var expectedCounter = 1
 
-        destination.outputStream().use { rawOutput ->
-            BufferedOutputStream(rawOutput, TcpFileTransfer.STREAM_BUFFER_SIZE).use { output ->
+        FileOutputStream(destination, resumeOffset > 0L).use { rawOutput ->
+            BufferedOutputStream(rawOutput, TcpFileTransfer.STREAM_BUFFER_SIZE).use { fileOutput ->
                 while (received < header.sizeBytes) {
                     cancellation?.throwIfCancelled()
                     val frame = readEncryptedFrame(input, TcpFileTransfer.STREAM_BUFFER_SIZE)
@@ -219,23 +310,23 @@ object SecureTcpFileTransfer {
                     )
                     require(plain.size == frame.plainLength) { "Secure frame length mismatch" }
                     require(received + plain.size <= header.sizeBytes) { "Secure payload exceeds declared size" }
-                    output.write(plain)
-                    digest.update(plain)
+                    fileOutput.write(plain)
                     received += plain.size
+                    networkReceived += plain.size
                     onProgress(received, header.sizeBytes)
                 }
-                output.flush()
+                fileOutput.flush()
             }
         }
 
         cancellation?.throwIfCancelled()
-        val actualHash = digest.digest().joinToString("") { "%02x".format(it) }
+        val actualHash = sha256(destination, cancellation)
         val verified = actualHash.equals(header.sha256, ignoreCase = true)
         if (!verified) destination.delete()
 
-        acknowledgement.writeBoolean(verified)
+        output.writeBoolean(verified)
         writeBytes(
-            acknowledgement,
+            output,
             SecureSessionCrypto.acknowledgementMac(
                 sessionKey = link.sessionKey,
                 sessionId = link.sessionId,
@@ -243,18 +334,23 @@ object SecureTcpFileTransfer {
                 verified = verified,
             ),
         )
-        acknowledgement.flush()
+        output.flush()
         val elapsedMillis = nanosToMillis(System.nanoTime() - startedAt)
 
-        return TcpFileTransfer.Result(
-            header = header,
-            bytesTransferred = received,
-            verified = verified,
-            transferElapsedMillis = elapsedMillis,
-            effectiveSendBufferBytes = effectiveSendBuffer,
-            effectiveReceiveBufferBytes = effectiveReceiveBuffer,
-            encrypted = true,
-            securityVerificationCode = link.verificationCode,
+        return ReceiveResult(
+            transfer = TcpFileTransfer.Result(
+                header = header,
+                bytesTransferred = received,
+                verified = verified,
+                transferElapsedMillis = elapsedMillis,
+                effectiveSendBufferBytes = effectiveSendBuffer,
+                effectiveReceiveBufferBytes = effectiveReceiveBuffer,
+                encrypted = true,
+                securityVerificationCode = link.verificationCode,
+                resumedFromBytes = resumeOffset,
+                networkBytesTransferred = networkReceived,
+            ),
+            destination = destination,
         )
     }
 
@@ -309,6 +405,42 @@ object SecureTcpFileTransfer {
 
     private fun deserializeHeader(bytes: ByteArray): TransferHeader =
         DataInputStream(ByteArrayInputStream(bytes)).use(TransferHeader::readFrom)
+
+    private fun skipExactly(
+        input: InputStream,
+        bytesToSkip: Long,
+        cancellation: TransferCancellation?,
+    ) {
+        var remaining = bytesToSkip
+        val discard = ByteArray(TcpFileTransfer.STREAM_BUFFER_SIZE)
+        while (remaining > 0L) {
+            cancellation?.throwIfCancelled()
+            val skipped = input.skip(remaining)
+            if (skipped > 0L) {
+                remaining -= skipped
+                continue
+            }
+            val read = input.read(discard, 0, minOf(discard.size.toLong(), remaining).toInt())
+            check(read >= 0) { "Source ended before resume offset" }
+            remaining -= read
+        }
+    }
+
+    private fun sha256(file: File, cancellation: TransferCancellation?): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { raw ->
+            BufferedInputStream(raw, TcpFileTransfer.STREAM_BUFFER_SIZE).use { input ->
+                val buffer = ByteArray(TcpFileTransfer.STREAM_BUFFER_SIZE)
+                while (true) {
+                    cancellation?.throwIfCancelled()
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    if (read > 0) digest.update(buffer, 0, read)
+                }
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
 
     private fun connectWithRetry(
         host: String,
