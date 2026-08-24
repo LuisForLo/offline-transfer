@@ -9,6 +9,7 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import com.luisforlo.offlinetransfer.protocol.TransferHeader
+import com.luisforlo.offlinetransfer.security.SecuritySessionStore
 import com.luisforlo.offlinetransfer.security.SecureSessionCrypto
 import java.io.File
 
@@ -70,10 +71,11 @@ object AndroidFileTransfer {
             sha256 = sha256,
         )
 
-        val result = if (secureLink != null) {
+        val effectiveSecureLink = secureLink ?: SecuritySessionStore.linkForSend()
+        val result = if (effectiveSecureLink != null) {
             SecureTcpFileTransfer.send(
                 host = host,
-                link = secureLink,
+                link = effectiveSecureLink,
                 header = header,
                 inputFactory = {
                     resolver.openInputStream(uri)
@@ -107,10 +109,11 @@ object AndroidFileTransfer {
         val temporary = File.createTempFile("offline-transfer-", ".part", context.cacheDir)
 
         try {
-            val result = if (secureLink != null) {
+            val effectiveSecureLink = secureLink ?: SecuritySessionStore.linkForReceive()
+            val result = if (effectiveSecureLink != null) {
                 SecureTcpFileTransfer.receive(
                     destination = temporary,
-                    link = secureLink,
+                    link = effectiveSecureLink,
                     cancellation = cancellation,
                     onProgress = onProgress,
                 )
