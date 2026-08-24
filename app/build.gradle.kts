@@ -1,20 +1,48 @@
+import java.util.Base64
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val stableDevSigningDir = rootProject.file("dev-signing")
+val stableDevKeyBase64 = rootProject.file("dev-signing/offline-transfer-dev.keystore.b64")
+val stableDevKeystore = rootProject.file("dev-signing/offline-transfer-dev.keystore")
+
+if (!stableDevKeystore.exists() && stableDevKeyBase64.exists()) {
+    stableDevSigningDir.mkdirs()
+    stableDevKeystore.writeBytes(
+        Base64.getDecoder().decode(stableDevKeyBase64.readText().trim()),
+    )
 }
 
 android {
     namespace = "com.luisforlo.offlinetransfer"
     compileSdk = 37
 
+    signingConfigs {
+        create("stableDev") {
+            storeFile = stableDevKeystore
+            storePassword = "offline-transfer-dev"
+            keyAlias = "offline-transfer-dev"
+            keyPassword = "offline-transfer-dev"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.luisforlo.offlinetransfer"
         minSdk = 26
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.2.0-dev"
+        versionCode = 3
+        versionName = "0.2.1-dev"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("stableDev")
+        }
     }
 
     buildFeatures {
