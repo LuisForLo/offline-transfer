@@ -20,7 +20,7 @@ class WifiDirectManager(context: Context) {
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
     private val channel = manager.initialize(appContext, Looper.getMainLooper()) {
-        update { copy(status = "Canal Wi‑Fi Direct perdido", connected = false) }
+        resetDisconnected("Canal Wi‑Fi Direct perdido")
     }
 
     private val _state = MutableStateFlow(WifiDirectState())
@@ -52,14 +52,7 @@ class WifiDirectManager(context: Context) {
                     if (networkInfo?.isConnected == true) {
                         requestConnectionInfo()
                     } else {
-                        update {
-                            copy(
-                                connected = false,
-                                groupOwnerAddress = null,
-                                isGroupOwner = false,
-                                status = "Desconectado",
-                            )
-                        }
+                        resetDisconnected("Desconectado")
                     }
                 }
             }
@@ -104,18 +97,55 @@ class WifiDirectManager(context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun connect(device: WifiP2pDevice) {
+    fun connect(device: WifiP2pDevice, preferGroupOwner: Boolean) {
         val config = WifiP2pConfig().apply {
             deviceAddress = device.deviceAddress
+            groupOwnerIntent = if (preferGroupOwner) 15 else 0
         }
-        update { copy(status = "Conectando con ${device.deviceName.ifBlank { "dispositivo" }}…") }
+        val desiredRole = if (preferGroupOwner) "receptor" else "emisor"
+        update {
+            copy(
+                status = "Conectando con ${device.deviceName.ifBlank { "dispositivo" }} como $desiredRole…",
+            )
+        }
         manager.connect(channel, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                update { copy(status = "Solicitud de conexión enviada") }
+                update { copy(status = "Solicitud enviada · preferencia: $desiredRole") }
             }
 
             override fun onFailure(reason: Int) {
                 update { copy(status = "Conexión falló: ${reasonText(reason)}") }
+            }
+        })
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnect() {
+        update { copy(status = "Desconectando…", discovering = false) }
+        runCatching {
+            manager.stopPeerDiscovery(channel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() = Unit
+                override fun onFailure(reason: Int) = Unit
+            })
+        }
+
+        manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                resetDisconnected("Desconectado · elige rol y dispositivo")
+            }
+
+            override fun onFailure(reason: Int) {
+                manager.cancelConnect(channel, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        resetDisconnected("Conexión cancelada · elige rol y dispositivo")
+                    }
+
+                    override fun onFailure(cancelReason: Int) {
+                        resetDisconnected(
+                            "Desconectado localmente · ${reasonText(reason)} / ${reasonText(cancelReason)}",
+                        )
+                    }
+                })
             }
         })
     }
@@ -144,6 +174,19 @@ class WifiDirectManager(context: Context) {
                     status = if (info.groupFormed) "Conexión Wi‑Fi Direct lista" else "Negociando grupo…",
                 )
             }
+        }
+    }
+
+    private fun resetDisconnected(status: String) {
+        update {
+            copy(
+                discovering = false,
+                peers = emptyList(),
+                connected = false,
+                groupOwnerAddress = null,
+                isGroupOwner = false,
+                status = status,
+            )
         }
     }
 
