@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -16,7 +15,6 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -32,13 +30,11 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
@@ -47,25 +43,21 @@ import androidx.core.content.ContextCompat
 import com.luisforlo.offlinetransfer.pairing.QrCodeGenerator
 import com.luisforlo.offlinetransfer.pairing.QrPairingPayload
 import com.luisforlo.offlinetransfer.pairing.QrScannerView
-import com.luisforlo.offlinetransfer.transfer.AndroidFileTransfer
-import com.luisforlo.offlinetransfer.transfer.TcpFileTransfer
-import com.luisforlo.offlinetransfer.transfer.TransferCancellation
-import com.luisforlo.offlinetransfer.transfer.TransferCancelledException
-import com.luisforlo.offlinetransfer.transfer.TransferMetricsCalculator
+import com.luisforlo.offlinetransfer.transfer.background.BackgroundTransferDirection
+import com.luisforlo.offlinetransfer.transfer.background.BackgroundTransferPhase
+import com.luisforlo.offlinetransfer.transfer.background.TransferForegroundService
+import com.luisforlo.offlinetransfer.transfer.background.TransferRuntimeStore
 import com.luisforlo.offlinetransfer.transport.wifidirect.WifiDirectManager
+import com.luisforlo.offlinetransfer.transport.wifidirect.WifiDirectSession
 import com.luisforlo.offlinetransfer.ui.theme.OfflineTransferTheme
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.util.Locale
-import kotlin.math.ceil
 
 class MainActivity : ComponentActivity() {
     private lateinit var wifiDirect: WifiDirectManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        wifiDirect = WifiDirectManager(this)
+        wifiDirect = WifiDirectSession.get(this)
 
         setContent {
             OfflineTransferTheme {
@@ -80,56 +72,23 @@ private enum class DesiredRole {
     RECEIVE,
 }
 
-private enum class TransferPhase {
-    IDLE,
-    PREPARING,
-    WAITING,
-    TRANSFERRING,
-    COMPLETE,
-    CANCELLED,
-    ERROR,
-}
-
-private data class TransferUiState(
-    val phase: TransferPhase = TransferPhase.IDLE,
-    val message: String = "Sin transferencia activa",
-    val bytesDone: Long = 0L,
-    val bytesTotal: Long = 0L,
-    val currentFile: String? = null,
-    val fileIndex: Int = 0,
-    val fileCount: Int = 0,
-    val speedBytesPerSecond: Double = 0.0,
-    val etaSeconds: Long? = null,
-    val diagnostics: String? = null,
-)
-
-private data class TransferHistoryEntry(
-    val id: Long,
-    val direction: String,
-    val fileName: String,
-    val sizeBytes: Long,
-    val detail: String,
-)
-
 @Composable
 private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     val activity = this
-    val scope = rememberCoroutineScope()
-    val state by wifiDirect.state.collectAsState()
+    val wifiState by wifiDirect.state.collectAsState()
+    val transfer by TransferRuntimeStore.state.collectAsState()
 
     var desiredRole by remember { mutableStateOf(DesiredRole.SEND) }
     var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
-    var permissionGranted by remember { mutableStateOf(hasNearbyPermission()) }
+    var nearbyPermissionGranted by remember { mutableStateOf(hasNearbyPermission()) }
     var cameraPermissionGranted by remember { mutableStateOf(hasCameraPermission()) }
+    var notificationPermissionGranted by remember { mutableStateOf(hasNotificationPermission()) }
     var showQrScanner by remember { mutableStateOf(false) }
     var qrMessage by remember { mutableStateOf<String?>(null) }
-    var transferUi by remember { mutableStateOf(TransferUiState()) }
-    var transferCancellation by remember { mutableStateOf<TransferCancellation?>(null) }
-    var history by remember { mutableStateOf<List<TransferHistoryEntry>>(emptyList()) }
 
-    val permissionLauncher = rememberLauncherForActivityResult(
+    val nearbyPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) { granted -> permissionGranted = granted }
+    ) { granted -> nearbyPermissionGranted = granted }
 
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -138,6 +97,10 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         showQrScanner = granted
         if (!granted) qrMessage = "Se necesita permiso de cámara para escanear el QR."
     }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> notificationPermissionGranted = granted }
 
     val filePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments(),
@@ -153,11 +116,11 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         }
     }
 
-    val localQrPayload = remember(state.thisDeviceAddress, state.thisDeviceName) {
-        state.thisDeviceAddress?.let { address ->
+    val localQrPayload = remember(wifiState.thisDeviceAddress, wifiState.thisDeviceName) {
+        wifiState.thisDeviceAddress?.let { address ->
             QrPairingPayload.create(
                 deviceAddress = address,
-                deviceName = state.thisDeviceName ?: "Android",
+                deviceName = wifiState.thisDeviceName ?: "Android",
             )
         }
     }
@@ -165,37 +128,31 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         localQrPayload?.let { QrCodeGenerator.create(it.encode()) }
     }
 
-    DisposableEffect(Unit) {
-        wifiDirect.register()
-        onDispose {
-            transferCancellation?.cancel()
-            wifiDirect.unregister()
+    LaunchedEffect(Unit) {
+        TransferForegroundService.refreshPartialSummary(activity)
+        if (!nearbyPermissionGranted) {
+            nearbyPermissionLauncher.launch(requiredNearbyPermission())
+        }
+        if (Build.VERSION.SDK_INT >= 33 && !notificationPermissionGranted) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
-    LaunchedEffect(Unit) {
-        if (!permissionGranted) permissionLauncher.launch(requiredNearbyPermission())
-    }
-
-    LaunchedEffect(desiredRole, permissionGranted, state.connected) {
-        if (desiredRole == DesiredRole.RECEIVE && permissionGranted && !state.connected) {
+    LaunchedEffect(desiredRole, nearbyPermissionGranted, wifiState.connected) {
+        if (desiredRole == DesiredRole.RECEIVE && nearbyPermissionGranted && !wifiState.connected) {
             wifiDirect.refreshThisDevice()
             wifiDirect.discoverPeers()
         }
     }
 
-    val transferBusy = transferUi.phase == TransferPhase.PREPARING ||
-        transferUi.phase == TransferPhase.WAITING ||
-        transferUi.phase == TransferPhase.TRANSFERRING
+    val transferBusy = transfer.busy
 
     fun resetAndDisconnect() {
-        transferCancellation?.cancel()
-        transferCancellation = null
+        if (transferBusy) return
         selectedFiles = emptyList()
-        history = emptyList()
         showQrScanner = false
         qrMessage = null
-        transferUi = TransferUiState(message = "Sesión cerrada. Elige rol y dispositivo.")
+        TransferRuntimeStore.reset("Sesión cerrada. Elige rol y dispositivo.")
         wifiDirect.disconnect()
     }
 
@@ -204,232 +161,10 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         qrMessage = null
     }
 
-    BackHandler(enabled = state.connected && !showQrScanner) {
+    // During an active foreground transfer the normal Android Back action closes
+    // only the Activity; the service and P2P session deliberately continue.
+    BackHandler(enabled = wifiState.connected && !showQrScanner && !transferBusy) {
         resetAndDisconnect()
-    }
-
-    fun stopTransfer() {
-        transferUi = transferUi.copy(message = "Cancelando transferencia…")
-        transferCancellation?.cancel()
-    }
-
-    fun startReceiveSession() {
-        val cancellation = TransferCancellation()
-        transferCancellation = cancellation
-
-        scope.launch {
-            var receivedCount = 0
-            try {
-                while (!cancellation.isCancelled) {
-                    transferUi = TransferUiState(
-                        phase = TransferPhase.WAITING,
-                        message = if (receivedCount == 0) {
-                            "Receptor listo. Esperando archivos…"
-                        } else {
-                            "✓ $receivedCount archivo(s) recibido(s). Esperando el siguiente…"
-                        },
-                        fileIndex = receivedCount + 1,
-                    )
-
-                    var networkStartMillis = 0L
-                    var lastUiUpdate = 0L
-                    val saved = withContext(Dispatchers.IO) {
-                        AndroidFileTransfer.receiveAndSave(
-                            context = activity,
-                            cancellation = cancellation,
-                        ) { received, total ->
-                            val now = SystemClock.elapsedRealtime()
-                            if (networkStartMillis == 0L) networkStartMillis = now
-                            if (now - lastUiUpdate >= 150L || received == total) {
-                                lastUiUpdate = now
-                                val metrics = TransferMetricsCalculator.calculate(
-                                    bytesDone = received,
-                                    bytesTotal = total,
-                                    elapsedMillis = (now - networkStartMillis).coerceAtLeast(1L),
-                                )
-                                activity.runOnUiThread {
-                                    transferUi = TransferUiState(
-                                        phase = TransferPhase.TRANSFERRING,
-                                        message = "Recibiendo archivo…",
-                                        bytesDone = received,
-                                        bytesTotal = total,
-                                        fileIndex = receivedCount + 1,
-                                        speedBytesPerSecond = metrics.bytesPerSecond,
-                                        etaSeconds = metrics.etaSeconds,
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    receivedCount++
-                    val diagnostics = formatPerformance(
-                        result = saved.transfer,
-                        showPreparation = false,
-                        showPublish = true,
-                    )
-                    history = listOf(
-                        TransferHistoryEntry(
-                            id = System.nanoTime(),
-                            direction = "RECIBIDO",
-                            fileName = saved.transfer.header.fileName,
-                            sizeBytes = saved.transfer.bytesTransferred,
-                            detail = "$diagnostics\n${saved.location}",
-                        ),
-                    ) + history
-
-                    transferUi = TransferUiState(
-                        phase = TransferPhase.WAITING,
-                        message = "✓ ${saved.transfer.header.fileName} verificado. Esperando otro archivo…",
-                        bytesDone = saved.transfer.bytesTransferred,
-                        bytesTotal = saved.transfer.header.sizeBytes,
-                        currentFile = saved.transfer.header.fileName,
-                        fileIndex = receivedCount + 1,
-                        diagnostics = diagnostics,
-                    )
-                }
-            } catch (_: TransferCancelledException) {
-                transferUi = TransferUiState(
-                    phase = TransferPhase.CANCELLED,
-                    message = if (receivedCount > 0) {
-                        "Sesión finalizada. $receivedCount archivo(s) recibido(s) correctamente."
-                    } else {
-                        "Recepción detenida."
-                    },
-                )
-            } catch (error: Throwable) {
-                transferUi = TransferUiState(
-                    phase = TransferPhase.ERROR,
-                    message = "Error al recibir: ${error.message ?: error.javaClass.simpleName}",
-                )
-            } finally {
-                transferCancellation = null
-            }
-        }
-    }
-
-    fun sendFiles(uris: List<Uri>, host: String) {
-        val cancellation = TransferCancellation()
-        transferCancellation = cancellation
-
-        scope.launch {
-            try {
-                transferUi = TransferUiState(
-                    phase = TransferPhase.PREPARING,
-                    message = "Leyendo información de ${uris.size} archivo(s)…",
-                    fileCount = uris.size,
-                )
-
-                val files = withContext(Dispatchers.IO) {
-                    uris.map { uri ->
-                        cancellation.throwIfCancelled()
-                        AndroidFileTransfer.inspect(activity, uri)
-                    }
-                }
-                val totalBatchBytes = files.sumOf { it.sizeBytes }
-                var completedBytes = 0L
-                var lastDiagnostics: String? = null
-
-                files.forEachIndexed { index, file ->
-                    cancellation.throwIfCancelled()
-                    transferUi = TransferUiState(
-                        phase = TransferPhase.PREPARING,
-                        message = "Calculando SHA-256 de ${file.fileName}…",
-                        bytesDone = completedBytes,
-                        bytesTotal = totalBatchBytes,
-                        currentFile = file.fileName,
-                        fileIndex = index + 1,
-                        fileCount = files.size,
-                    )
-
-                    var networkStartMillis = 0L
-                    var lastUiUpdate = 0L
-                    val result = withContext(Dispatchers.IO) {
-                        AndroidFileTransfer.send(
-                            context = activity,
-                            uri = file.uri,
-                            host = host,
-                            cancellation = cancellation,
-                        ) { sent, fileTotal ->
-                            val now = SystemClock.elapsedRealtime()
-                            if (networkStartMillis == 0L) networkStartMillis = now
-                            if (now - lastUiUpdate >= 150L || sent == fileTotal) {
-                                lastUiUpdate = now
-                                val metrics = TransferMetricsCalculator.calculate(
-                                    bytesDone = sent,
-                                    bytesTotal = fileTotal,
-                                    elapsedMillis = (now - networkStartMillis).coerceAtLeast(1L),
-                                )
-                                val batchDone = completedBytes + sent
-                                val remainingBatch = (totalBatchBytes - batchDone).coerceAtLeast(0L)
-                                val batchEta = if (metrics.bytesPerSecond > 0.0) {
-                                    ceil(remainingBatch / metrics.bytesPerSecond).toLong()
-                                } else {
-                                    null
-                                }
-
-                                activity.runOnUiThread {
-                                    transferUi = TransferUiState(
-                                        phase = TransferPhase.TRANSFERRING,
-                                        message = if (sent == fileTotal) {
-                                            "Archivo enviado; esperando verificación SHA-256…"
-                                        } else {
-                                            "Enviando ${file.fileName}…"
-                                        },
-                                        bytesDone = batchDone,
-                                        bytesTotal = totalBatchBytes,
-                                        currentFile = file.fileName,
-                                        fileIndex = index + 1,
-                                        fileCount = files.size,
-                                        speedBytesPerSecond = metrics.bytesPerSecond,
-                                        etaSeconds = batchEta,
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    check(result.verified) { "El receptor detectó que SHA-256 no coincide" }
-                    completedBytes += file.sizeBytes
-                    lastDiagnostics = formatPerformance(
-                        result = result,
-                        showPreparation = true,
-                        showPublish = false,
-                    )
-                    history = listOf(
-                        TransferHistoryEntry(
-                            id = System.nanoTime(),
-                            direction = "ENVIADO",
-                            fileName = result.header.fileName,
-                            sizeBytes = result.bytesTransferred,
-                            detail = "SHA-256 verificado · $lastDiagnostics",
-                        ),
-                    ) + history
-                }
-
-                transferUi = TransferUiState(
-                    phase = TransferPhase.COMPLETE,
-                    message = "✓ ${files.size} archivo(s) transferido(s) y verificado(s).",
-                    bytesDone = totalBatchBytes,
-                    bytesTotal = totalBatchBytes,
-                    fileIndex = files.size,
-                    fileCount = files.size,
-                    diagnostics = lastDiagnostics,
-                )
-            } catch (_: TransferCancelledException) {
-                transferUi = TransferUiState(
-                    phase = TransferPhase.CANCELLED,
-                    message = "Envío cancelado.",
-                )
-            } catch (error: Throwable) {
-                transferUi = TransferUiState(
-                    phase = TransferPhase.ERROR,
-                    message = "Error al enviar: ${error.message ?: error.javaClass.simpleName}",
-                )
-            } finally {
-                transferCancellation = null
-            }
-        }
     }
 
     Scaffold { padding ->
@@ -442,10 +177,32 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("0.4.0-dev · emparejamiento QR + Wi-Fi Direct optimizado")
+                Text("0.7.0-dev · segundo plano + E2E + reanudación persistente")
             }
 
-            if (!state.connected) {
+            if (transferBusy) {
+                item {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text("Servicio activo", style = MaterialTheme.typography.titleMedium)
+                            Text("Puedes minimizar la app o apagar la pantalla. La transferencia continúa desde la notificación.")
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                OutlinedButton(onClick = { TransferForegroundService.pause(activity) }) {
+                                    Text("Pausar")
+                                }
+                                OutlinedButton(onClick = { TransferForegroundService.cancel(activity) }) {
+                                    Text("Cancelar")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!wifiState.connected && !transferBusy) {
                 item {
                     Card(Modifier.fillMaxWidth()) {
                         Column(
@@ -499,13 +256,10 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                         modifier = Modifier.size(260.dp),
                                     )
                                     Text(
-                                        state.thisDeviceName ?: "Este Android",
+                                        wifiState.thisDeviceName ?: "Este Android",
                                         style = MaterialTheme.typography.titleSmall,
                                     )
-                                    Text(
-                                        "QR listo · esperando al emisor…",
-                                        style = MaterialTheme.typography.bodySmall,
-                                    )
+                                    Text("QR seguro listo · esperando al emisor…")
                                 } else {
                                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                                     Text("Preparando identidad Wi-Fi Direct…")
@@ -518,7 +272,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                 }
                             } else {
                                 Text("2. Escanea el QR del receptor", style = MaterialTheme.typography.titleMedium)
-                                Text("La app buscará y conectará automáticamente al teléfono correcto.")
+                                Text("La app identificará y conectará automáticamente al teléfono correcto.")
 
                                 if (showQrScanner) {
                                     QrScannerView(
@@ -549,7 +303,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                     }
                                 } else {
                                     Button(
-                                        enabled = permissionGranted,
+                                        enabled = nearbyPermissionGranted,
                                         onClick = {
                                             qrMessage = null
                                             if (cameraPermissionGranted) {
@@ -564,61 +318,63 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                 }
                             }
 
-                            qrMessage?.let {
-                                Text(it, style = MaterialTheme.typography.bodySmall)
-                            }
+                            qrMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         }
                     }
                 }
             }
 
-            item {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(
-                        Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Text(
-                            if (state.connected) "Wi-Fi Direct" else "Conexión manual · respaldo",
-                            style = MaterialTheme.typography.titleMedium,
-                        )
-                        Text(state.status)
-                        Text(if (state.enabled) "P2P disponible" else "P2P no disponible o desactivado")
-
-                        if (state.connected) {
-                            val actualReceiving = state.isGroupOwner
+            if (!transferBusy) {
+                item {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
                             Text(
-                                if (actualReceiving) {
-                                    "MODO RECEPTOR · recepción continua"
-                                } else {
-                                    "MODO EMISOR · uno o varios archivos"
-                                },
+                                if (wifiState.connected) "Wi-Fi Direct" else "Conexión manual · respaldo",
                                 style = MaterialTheme.typography.titleMedium,
                             )
-                            Text("Host del grupo: ${state.groupOwnerAddress ?: "—"}")
-                            Text(
-                                "Perfil TCP: chunks 1 MiB · buffer solicitado 4 MiB",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+                            Text(wifiState.status)
+                            Text(if (wifiState.enabled) "P2P disponible" else "P2P no disponible o desactivado")
 
-                            OutlinedButton(
-                                enabled = !transferBusy,
-                                onClick = { resetAndDisconnect() },
-                            ) {
-                                Text("Cambiar dispositivo / rol")
-                            }
-                        } else {
-                            OutlinedButton(
-                                enabled = permissionGranted && !transferBusy,
-                                onClick = { wifiDirect.discoverPeers() },
-                            ) {
-                                Text(if (state.discovering) "Buscando…" else "Buscar manualmente")
-                            }
-                            if (!permissionGranted) {
+                            if (wifiState.connected) {
+                                Text(
+                                    if (wifiState.isGroupOwner) {
+                                        "MODO RECEPTOR · recepción continua"
+                                    } else {
+                                        "MODO EMISOR · uno o varios archivos"
+                                    },
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                                Text("Host del grupo: ${wifiState.groupOwnerAddress ?: "—"}")
+                                Text(
+                                    if (wifiState.secureLinkEstablished) {
+                                        "🔐 AES-256-GCM · código ${wifiState.securityVerificationCode ?: "—"}"
+                                    } else {
+                                        "⚠ Sin cifrado E2E confirmado"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text(
+                                    "Perfil TCP: chunks 1 MiB · buffer solicitado 4 MiB",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+
+                                OutlinedButton(onClick = { resetAndDisconnect() }) {
+                                    Text("Cambiar dispositivo / rol")
+                                }
+                            } else {
                                 OutlinedButton(
-                                    onClick = { permissionLauncher.launch(requiredNearbyPermission()) },
+                                    enabled = nearbyPermissionGranted,
+                                    onClick = { wifiDirect.discoverPeers() },
                                 ) {
-                                    Text("Dar permiso Wi-Fi")
+                                    Text(if (wifiState.discovering) "Buscando…" else "Buscar manualmente")
+                                }
+                                if (!nearbyPermissionGranted) {
+                                    OutlinedButton(
+                                        onClick = { nearbyPermissionLauncher.launch(requiredNearbyPermission()) },
+                                    ) { Text("Dar permiso Wi-Fi") }
                                 }
                             }
                         }
@@ -626,9 +382,9 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                 }
             }
 
-            if (state.peers.isNotEmpty() && !state.connected && !showQrScanner) {
+            if (wifiState.peers.isNotEmpty() && !wifiState.connected && !showQrScanner && !transferBusy) {
                 item { Text("Dispositivos encontrados", style = MaterialTheme.typography.titleMedium) }
-                items(state.peers, key = { it.deviceAddress }) { peer ->
+                items(wifiState.peers, key = { it.deviceAddress }) { peer ->
                     Card(Modifier.fillMaxWidth()) {
                         Column(
                             Modifier
@@ -639,7 +395,6 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             Text(peer.deviceName.ifBlank { "Android cercano" })
                             Text(peer.deviceAddress, style = MaterialTheme.typography.bodySmall)
                             Button(
-                                enabled = !transferBusy,
                                 onClick = {
                                     wifiDirect.connect(
                                         device = peer,
@@ -654,7 +409,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                 }
             }
 
-            if (state.connected && !state.isGroupOwner) {
+            if (wifiState.connected && !wifiState.isGroupOwner && !transferBusy) {
                 item {
                     Card(Modifier.fillMaxWidth()) {
                         Column(
@@ -669,25 +424,27 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                     else -> "${selectedFiles.size} archivos seleccionados"
                                 },
                             )
-                            OutlinedButton(
-                                enabled = !transferBusy,
-                                onClick = { filePicker.launch(arrayOf("*/*")) },
-                            ) { Text("Seleccionar archivos") }
+                            OutlinedButton(onClick = { filePicker.launch(arrayOf("*/*")) }) {
+                                Text("Seleccionar archivos")
+                            }
                             Button(
-                                enabled = selectedFiles.isNotEmpty() && state.groupOwnerAddress != null && !transferBusy,
+                                enabled = selectedFiles.isNotEmpty() &&
+                                    wifiState.groupOwnerAddress != null &&
+                                    (!wifiState.status.contains("negociando cifrado", ignoreCase = true)),
                                 onClick = {
-                                    state.groupOwnerAddress?.let { sendFiles(selectedFiles, it) }
+                                    wifiState.groupOwnerAddress?.let { host ->
+                                        TransferForegroundService.startSend(activity, selectedFiles, host)
+                                    }
                                 },
-                            ) { Text("Enviar ahora") }
-                            if (transferBusy) {
-                                OutlinedButton(onClick = { stopTransfer() }) { Text("Cancelar envío") }
+                            ) {
+                                Text("Enviar en segundo plano")
                             }
                         }
                     }
                 }
             }
 
-            if (state.connected && state.isGroupOwner) {
+            if (wifiState.connected && wifiState.isGroupOwner && !transferBusy) {
                 item {
                     Card(Modifier.fillMaxWidth()) {
                         Column(
@@ -695,11 +452,9 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             verticalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
                             Text("Recibir archivos", style = MaterialTheme.typography.titleMedium)
-                            Text("La sesión queda escuchando para recibir varios archivos consecutivos.")
-                            if (transferBusy) {
-                                OutlinedButton(onClick = { stopTransfer() }) { Text("Detener recepción") }
-                            } else {
-                                Button(onClick = { startReceiveSession() }) { Text("Iniciar recepción") }
+                            Text("La recepción continuará aunque minimices la app o apagues la pantalla.")
+                            Button(onClick = { TransferForegroundService.startReceive(activity) }) {
+                                Text("Iniciar recepción en segundo plano")
                             }
                             Text(
                                 "Los archivos verificados se guardan en Descargas/Offline Transfer.",
@@ -710,7 +465,25 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                 }
             }
 
-            if (state.connected || transferUi.phase != TransferPhase.IDLE) {
+            if (transfer.partialCount > 0) {
+                item {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text("Transferencias recuperables", style = MaterialTheme.typography.titleMedium)
+                            Text("${transfer.partialCount} parcial(es) · ${formatBytes(transfer.partialBytes)} guardados")
+                            Text(
+                                "Se conservarán aunque cierres la app y se usarán automáticamente al enviar el mismo archivo.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (wifiState.connected || transfer.phase != BackgroundTransferPhase.IDLE) {
                 item {
                     Card(Modifier.fillMaxWidth()) {
                         Column(
@@ -718,53 +491,75 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             Text("Transferencia", style = MaterialTheme.typography.titleMedium)
-                            Text(transferUi.message)
-                            transferUi.currentFile?.let { Text(it) }
+                            Text(transfer.message)
+                            transfer.currentFile?.let { Text(it) }
 
-                            if (transferUi.fileCount > 0) {
+                            if (transfer.fileCount > 0) {
                                 Text(
-                                    "Archivo ${transferUi.fileIndex.coerceAtMost(transferUi.fileCount)} de ${transferUi.fileCount}",
+                                    "Archivo ${transfer.fileIndex.coerceAtMost(transfer.fileCount)} de ${transfer.fileCount}",
                                     style = MaterialTheme.typography.bodySmall,
                                 )
-                            } else if (transferUi.fileIndex > 0 && state.isGroupOwner) {
-                                Text("Archivo #${transferUi.fileIndex}", style = MaterialTheme.typography.bodySmall)
+                            } else if (transfer.fileIndex > 0 && transfer.direction == BackgroundTransferDirection.RECEIVE) {
+                                Text("Archivo #${transfer.fileIndex}", style = MaterialTheme.typography.bodySmall)
                             }
 
-                            if (transferUi.bytesTotal > 0L) {
-                                val progress = (transferUi.bytesDone.toFloat() / transferUi.bytesTotal.toFloat())
+                            if (transfer.bytesTotal > 0L) {
+                                val progress = (transfer.bytesDone.toFloat() / transfer.bytesTotal.toFloat())
                                     .coerceIn(0f, 1f)
                                 LinearProgressIndicator(
                                     progress = { progress },
                                     modifier = Modifier.fillMaxWidth(),
                                 )
                                 Text(
-                                    "${formatBytes(transferUi.bytesDone)} / ${formatBytes(transferUi.bytesTotal)}",
+                                    "${formatBytes(transfer.bytesDone)} / ${formatBytes(transfer.bytesTotal)}",
                                     style = MaterialTheme.typography.bodySmall,
                                 )
                             } else if (transferBusy) {
                                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                             }
 
-                            if (transferUi.speedBytesPerSecond > 0.0) {
+                            if (transfer.speedBytesPerSecond > 0.0) {
                                 Text(
-                                    "${formatRate(transferUi.speedBytesPerSecond)}" +
-                                        (transferUi.etaSeconds?.let { " · ${formatEta(it)} restantes" } ?: ""),
+                                    "${formatRate(transfer.speedBytesPerSecond)}" +
+                                        (transfer.etaSeconds?.let { " · ${formatEta(it)} restantes" } ?: ""),
                                     style = MaterialTheme.typography.titleMedium,
                                 )
                             }
 
-                            transferUi.diagnostics?.let {
+                            if (transfer.encrypted) {
+                                Text(
+                                    "🔐 AES-256-GCM · E2E" +
+                                        (transfer.verificationCode?.let { " · código $it" } ?: ""),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+
+                            if (transfer.resumedFromBytes > 0L) {
+                                Text(
+                                    "Reanudado desde ${formatBytes(transfer.resumedFromBytes)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+
+                            transfer.diagnostics?.let {
                                 Text("Diagnóstico", style = MaterialTheme.typography.titleSmall)
                                 Text(it, style = MaterialTheme.typography.bodySmall)
+                            }
+
+                            if (transfer.phase == BackgroundTransferPhase.PAUSED) {
+                                Text(
+                                    "Para continuar, reconecta por QR y selecciona el mismo archivo; el parcial se detectará automáticamente.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
                             }
                         }
                     }
                 }
             }
 
-            if (history.isNotEmpty()) {
+            if (transfer.history.isNotEmpty()) {
                 item { Text("Historial de esta sesión", style = MaterialTheme.typography.titleMedium) }
-                items(history.take(12), key = { it.id }) { entry ->
+                items(transfer.history.take(12), key = { it.id }) { entry ->
                     Card(Modifier.fillMaxWidth()) {
                         Column(
                             Modifier.padding(14.dp),
@@ -791,30 +586,9 @@ private fun ComponentActivity.hasNearbyPermission(): Boolean =
 private fun ComponentActivity.hasCameraPermission(): Boolean =
     ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
-private fun formatPerformance(
-    result: TcpFileTransfer.Result,
-    showPreparation: Boolean,
-    showPublish: Boolean,
-): String {
-    val parts = mutableListOf<String>()
-    parts += "Red ${formatRate(result.bytesPerSecond)} en ${formatDurationMs(result.transferElapsedMillis)}"
-
-    if (showPreparation && result.preparationElapsedMillis > 0L) {
-        val hashRate = result.bytesTransferred.toDouble() * 1_000.0 / result.preparationElapsedMillis.toDouble()
-        parts += "SHA-256 ${formatRate(hashRate)} en ${formatDurationMs(result.preparationElapsedMillis)}"
-    }
-
-    if (showPublish && result.publishElapsedMillis > 0L) {
-        val publishRate = result.bytesTransferred.toDouble() * 1_000.0 / result.publishElapsedMillis.toDouble()
-        parts += "Guardado ${formatRate(publishRate)} en ${formatDurationMs(result.publishElapsedMillis)}"
-    }
-
-    if (result.effectiveSendBufferBytes > 0 || result.effectiveReceiveBufferBytes > 0) {
-        parts += "TCP send ${formatBytes(result.effectiveSendBufferBytes.toLong())} · recv ${formatBytes(result.effectiveReceiveBufferBytes.toLong())}"
-    }
-
-    return parts.joinToString("\n")
-}
+private fun ComponentActivity.hasNotificationPermission(): Boolean =
+    Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
 private fun formatBytes(bytes: Long): String {
     if (bytes < 1024L) return "$bytes B"
@@ -830,11 +604,6 @@ private fun formatBytes(bytes: Long): String {
 
 private fun formatRate(bytesPerSecond: Double): String =
     "${formatBytes(bytesPerSecond.coerceAtLeast(0.0).toLong())}/s"
-
-private fun formatDurationMs(milliseconds: Long): String = when {
-    milliseconds < 1_000L -> "${milliseconds} ms"
-    else -> String.format(Locale.getDefault(), "%.2f s", milliseconds / 1_000.0)
-}
 
 private fun formatEta(seconds: Long): String {
     val safeSeconds = seconds.coerceAtLeast(0L)
