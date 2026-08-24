@@ -13,33 +13,55 @@ import java.io.File
 object AndroidFileTransfer {
     private const val COPY_BUFFER_SIZE = 256 * 1024
 
+    data class FileInfo(
+        val uri: Uri,
+        val fileName: String,
+        val mimeType: String,
+        val sizeBytes: Long,
+    )
+
     data class SavedResult(
         val transfer: TcpFileTransfer.Result,
         val location: String,
     )
 
-    fun send(
-        context: Context,
-        uri: Uri,
-        host: String,
-        onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
-    ): TcpFileTransfer.Result {
+    fun inspect(context: Context, uri: Uri): FileInfo {
         val resolver = context.contentResolver
         val metadata = readMetadata(context, uri)
         val sizeBytes = metadata.sizeBytes
             ?: resolver.openAssetFileDescriptor(uri, "r")?.use { descriptor ->
                 descriptor.length.takeIf { it >= 0L }
             }
-            ?: error("No se pudo determinar el tamaño del archivo")
+            ?: error("No se pudo determinar el tamaño de ${metadata.fileName}")
 
-        val sha256 = resolver.openInputStream(uri)?.use { input ->
-            FileHasher.sha256(input)
-        } ?: error("No se pudo abrir el archivo seleccionado")
-
-        val header = TransferHeader(
+        return FileInfo(
+            uri = uri,
             fileName = sanitizeFileName(metadata.fileName),
             mimeType = resolver.getType(uri) ?: "application/octet-stream",
             sizeBytes = sizeBytes,
+        )
+    }
+
+    fun send(
+        context: Context,
+        uri: Uri,
+        host: String,
+        cancellation: TransferCancellation? = null,
+        onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
+    ): TcpFileTransfer.Result {
+        val resolver = context.contentResolver
+        val info = inspect(context, uri)
+        cancellation?.throwIfCancelled()
+
+        val sha256 = resolver.openInputStream(uri)?.use { input ->
+            FileHasher.sha256(input, cancellation)
+        } ?: error("No se pudo abrir el archivo seleccionado")
+
+        cancellation?.throwIfCancelled()
+        val header = TransferHeader(
+            fileName = info.fileName,
+            mimeType = info.mimeType,
+            sizeBytes = info.sizeBytes,
             sha256 = sha256,
         )
 
@@ -50,12 +72,14 @@ object AndroidFileTransfer {
                 resolver.openInputStream(uri)
                     ?: error("No se pudo volver a abrir el archivo para enviarlo")
             },
+            cancellation = cancellation,
             onProgress = onProgress,
         )
     }
 
     fun receiveAndSave(
         context: Context,
+        cancellation: TransferCancellation? = null,
         onProgress: (received: Long, total: Long) -> Unit = { _, _ -> },
     ): SavedResult {
         val temporary = File.createTempFile("offline-transfer-", ".part", context.cacheDir)
@@ -63,8 +87,10 @@ object AndroidFileTransfer {
         try {
             val result = TcpFileTransfer.receive(
                 destination = temporary,
+                cancellation = cancellation,
                 onProgress = onProgress,
             )
+            cancellation?.throwIfCancelled()
             check(result.verified) { "SHA-256 no coincide; el archivo recibido fue descartado" }
 
             val location = publishVerifiedFile(
