@@ -10,8 +10,11 @@ import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
+import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import com.luisforlo.offlinetransfer.pairing.QrPairingRegistry
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -19,7 +22,9 @@ import kotlinx.coroutines.flow.asStateFlow
 class WifiDirectManager(context: Context) {
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = manager.initialize(appContext, Looper.getMainLooper()) {
+        clearPendingTarget()
         resetDisconnected("Canal Wi‑Fi Direct perdido")
     }
 
@@ -28,7 +33,16 @@ class WifiDirectManager(context: Context) {
 
     private var receiverRegistered = false
     private var pendingTargetAddress: String? = null
+    private var pendingTargetName: String? = null
     private var pendingPreferGroupOwner = false
+    private var targetSearchStartedAt = 0L
+    private var targetSearchAttempt = 0
+
+    private val targetRetry = Runnable {
+        if (pendingTargetAddress != null && !_state.value.connected) {
+            discoverPendingTarget()
+        }
+    }
 
     private val receiver = object : BroadcastReceiver() {
         @Suppress("DEPRECATION")
@@ -53,7 +67,10 @@ class WifiDirectManager(context: Context) {
                     }
                     if (networkInfo?.isConnected == true) {
                         requestConnectionInfo()
+                    } else if (!_state.value.connected) {
+                        update { copy(status = status.takeUnless { it.startsWith("QR leído") } ?: status) }
                     } else {
+                        clearPendingTarget()
                         resetDisconnected("Desconectado")
                     }
                 }
@@ -93,6 +110,7 @@ class WifiDirectManager(context: Context) {
     }
 
     fun unregister() {
+        mainHandler.removeCallbacks(targetRetry)
         if (!receiverRegistered) return
         appContext.unregisterReceiver(receiver)
         receiverRegistered = false
@@ -109,6 +127,11 @@ class WifiDirectManager(context: Context) {
 
     @SuppressLint("MissingPermission")
     fun discoverPeers() {
+        if (pendingTargetAddress != null) {
+            discoverPendingTarget()
+            return
+        }
+
         update { copy(discovering = true, status = "Buscando dispositivos…") }
         manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
@@ -123,35 +146,57 @@ class WifiDirectManager(context: Context) {
     }
 
     fun connect(device: WifiP2pDevice, preferGroupOwner: Boolean) {
-        pendingTargetAddress = null
+        clearPendingTarget()
         connectDevice(device, preferGroupOwner)
     }
 
-    @SuppressLint("MissingPermission")
     fun connectByAddress(deviceAddress: String, preferGroupOwner: Boolean) {
         val normalized = deviceAddress.trim()
         require(normalized.isNotBlank()) { "Dirección Wi‑Fi Direct vacía" }
+
+        clearPendingTarget(forgetRegistry = false)
         pendingTargetAddress = normalized
+        pendingTargetName = QrPairingRegistry.nameFor(normalized)
         pendingPreferGroupOwner = preferGroupOwner
+        targetSearchStartedAt = SystemClock.elapsedRealtime()
+        targetSearchAttempt = 0
 
         update {
             copy(
                 discovering = true,
-                status = "QR leído · buscando el teléfono correcto…",
+                status = pendingTargetName?.let { "QR leído · buscando $it…" }
+                    ?: "QR leído · buscando el teléfono correcto…",
             )
         }
+        discoverPendingTarget()
+    }
 
+    @SuppressLint("MissingPermission")
+    private fun discoverPendingTarget() {
+        if (pendingTargetAddress == null) return
+        if (targetSearchExpired()) {
+            finishTargetTimeout()
+            return
+        }
+
+        targetSearchAttempt++
+        mainHandler.removeCallbacks(targetRetry)
         manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
+                refreshThisDevice()
                 requestPeers()
             }
 
             override fun onFailure(reason: Int) {
-                update {
-                    copy(
-                        discovering = false,
-                        status = "QR leído, pero no se pudo buscar: ${reasonText(reason)}",
-                    )
+                // BUSY is common while a previous discovery cycle is still active.
+                // Read the current peer cache anyway before retrying.
+                requestPeers()
+                if (reason != WifiP2pManager.BUSY) {
+                    update {
+                        copy(
+                            status = "QR leído · reintentando búsqueda (${reasonText(reason)})…",
+                        )
+                    }
                 }
             }
         })
@@ -159,6 +204,7 @@ class WifiDirectManager(context: Context) {
 
     @SuppressLint("MissingPermission")
     private fun connectDevice(device: WifiP2pDevice, preferGroupOwner: Boolean) {
+        mainHandler.removeCallbacks(targetRetry)
         val config = WifiP2pConfig().apply {
             deviceAddress = device.deviceAddress
             groupOwnerIntent = if (preferGroupOwner) 15 else 0
@@ -183,7 +229,7 @@ class WifiDirectManager(context: Context) {
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
-        pendingTargetAddress = null
+        clearPendingTarget()
         update { copy(status = "Desconectando…", discovering = false) }
         runCatching {
             manager.stopPeerDiscovery(channel, object : WifiP2pManager.ActionListener {
@@ -218,35 +264,98 @@ class WifiDirectManager(context: Context) {
         manager.requestPeers(channel) { peerList ->
             val peers = peerList.deviceList.sortedBy { it.deviceName.lowercase() }
             val targetAddress = pendingTargetAddress
-            val target = targetAddress?.let { address ->
+            val targetName = pendingTargetName
+
+            val addressMatch = targetAddress?.let { address ->
                 peers.firstOrNull { it.deviceAddress.equals(address, ignoreCase = true) }
             }
 
+            val normalizedExpectedName = targetName?.let(::normalizeDeviceName).orEmpty()
+            val nameMatches = if (normalizedExpectedName.isNotBlank()) {
+                peers.filter { normalizeDeviceName(it.deviceName) == normalizedExpectedName }
+            } else {
+                emptyList()
+            }
+
+            // Only use the name fallback when it uniquely identifies one peer.
+            // This prevents connecting to the wrong phone in a crowded area.
+            val target = addressMatch ?: nameMatches.singleOrNull()
+
             if (target != null) {
                 val preferOwner = pendingPreferGroupOwner
-                pendingTargetAddress = null
-                update { copy(peers = peers, discovering = false) }
+                val matchedByName = addressMatch == null
+                clearPendingTarget()
+                update {
+                    copy(
+                        peers = peers,
+                        discovering = false,
+                        status = if (matchedByName) {
+                            "QR confirmado por nombre · conectando…"
+                        } else {
+                            "QR confirmado · conectando…"
+                        },
+                    )
+                }
                 connectDevice(target, preferOwner)
+                return@requestPeers
+            }
+
+            if (targetAddress != null) {
+                if (targetSearchExpired()) {
+                    update { copy(peers = peers) }
+                    finishTargetTimeout()
+                } else {
+                    val seconds = ((SystemClock.elapsedRealtime() - targetSearchStartedAt) / 1_000L)
+                        .coerceAtLeast(0L)
+                    update {
+                        copy(
+                            peers = peers,
+                            discovering = true,
+                            status = targetName?.let {
+                                "QR leído · buscando $it… ${seconds}s"
+                            } ?: "QR leído · buscando el receptor… ${seconds}s",
+                        )
+                    }
+                    scheduleTargetRetry()
+                }
             } else {
                 update {
                     copy(
                         peers = peers,
-                        discovering = targetAddress != null,
-                        status = if (targetAddress != null) {
-                            "QR leído · esperando que aparezca el teléfono…"
-                        } else {
-                            "${peers.size} dispositivo(s) encontrado(s)"
-                        },
+                        discovering = false,
+                        status = "${peers.size} dispositivo(s) encontrado(s)",
                     )
                 }
             }
         }
     }
 
+    private fun scheduleTargetRetry() {
+        mainHandler.removeCallbacks(targetRetry)
+        mainHandler.postDelayed(targetRetry, TARGET_RETRY_MS)
+    }
+
+    private fun targetSearchExpired(): Boolean =
+        targetSearchStartedAt > 0L &&
+            SystemClock.elapsedRealtime() - targetSearchStartedAt >= TARGET_TIMEOUT_MS
+
+    private fun finishTargetTimeout() {
+        val targetName = pendingTargetName
+        clearPendingTarget()
+        update {
+            copy(
+                discovering = false,
+                status = targetName?.let {
+                    "No encontramos $it en 20 s. Vuelve a escanear o usa conexión manual."
+                } ?: "No encontramos el receptor en 20 s. Vuelve a escanear o usa conexión manual.",
+            )
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun requestConnectionInfo() {
         manager.requestConnectionInfo(channel) { info ->
-            pendingTargetAddress = null
+            clearPendingTarget()
             update {
                 copy(
                     connected = info.groupFormed,
@@ -268,6 +377,19 @@ class WifiDirectManager(context: Context) {
         }
     }
 
+    private fun clearPendingTarget(forgetRegistry: Boolean = true) {
+        mainHandler.removeCallbacks(targetRetry)
+        val address = pendingTargetAddress
+        if (forgetRegistry && address != null) {
+            QrPairingRegistry.forget(address)
+        }
+        pendingTargetAddress = null
+        pendingTargetName = null
+        pendingPreferGroupOwner = false
+        targetSearchStartedAt = 0L
+        targetSearchAttempt = 0
+    }
+
     private fun resetDisconnected(status: String) {
         update {
             copy(
@@ -281,6 +403,9 @@ class WifiDirectManager(context: Context) {
         }
     }
 
+    private fun normalizeDeviceName(value: String): String =
+        value.lowercase().filter { it.isLetterOrDigit() }
+
     private fun update(block: WifiDirectState.() -> WifiDirectState) {
         _state.value = _state.value.block()
     }
@@ -290,5 +415,10 @@ class WifiDirectManager(context: Context) {
         WifiP2pManager.BUSY -> "sistema ocupado"
         WifiP2pManager.ERROR -> "error interno"
         else -> "código $reason"
+    }
+
+    private companion object {
+        const val TARGET_RETRY_MS = 1_500L
+        const val TARGET_TIMEOUT_MS = 20_000L
     }
 }
