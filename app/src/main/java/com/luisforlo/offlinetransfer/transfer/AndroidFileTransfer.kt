@@ -15,7 +15,6 @@ import java.io.File
 
 object AndroidFileTransfer {
     private const val COPY_BUFFER_SIZE = 1024 * 1024
-    private const val RESUME_DIRECTORY = "resumable-transfers"
 
     data class FileInfo(
         val uri: Uri,
@@ -126,16 +125,17 @@ object AndroidFileTransfer {
         }
     }
 
+    fun resumableEntries(context: Context): List<ResumeStore.Entry> = ResumeStore.list(context)
+
     private fun receiveSecureAndSave(
         context: Context,
         link: SecureSessionCrypto.SecureLink,
         cancellation: TransferCancellation?,
         onProgress: (received: Long, total: Long) -> Unit,
     ): SavedResult {
-        val resumeDirectory = File(context.filesDir, RESUME_DIRECTORY).apply { mkdirs() }
         val received = SecureTcpFileTransfer.receiveResumable(
             link = link,
-            destinationFor = { header -> resumablePartialFile(resumeDirectory, header) },
+            destinationFor = { header -> ResumeStore.partialFor(context, header) },
             cancellation = cancellation,
             onProgress = onProgress,
         )
@@ -154,8 +154,9 @@ object AndroidFileTransfer {
         val publishElapsedMillis =
             (SystemClock.elapsedRealtime() - publishStartedAt).coerceAtLeast(1L)
 
-        // Only remove the resumable copy after Android has successfully published the final file.
-        received.destination.delete()
+        // Only remove the resumable payload+manifest after Android has successfully
+        // published the final verified file.
+        ResumeStore.remove(context, result.header)
         return SavedResult(
             transfer = result.copy(publishElapsedMillis = publishElapsedMillis),
             location = location,
@@ -194,14 +195,6 @@ object AndroidFileTransfer {
         } finally {
             temporary.delete()
         }
-    }
-
-    private fun resumablePartialFile(directory: File, header: TransferHeader): File {
-        val hash = header.sha256.lowercase().trim()
-        require(hash.length == 64 && hash.all { it in '0'..'9' || it in 'a'..'f' }) {
-            "SHA-256 inválido para reanudación"
-        }
-        return File(directory, "$hash-${header.sizeBytes}.part")
     }
 
     private data class DocumentMetadata(
