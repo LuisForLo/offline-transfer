@@ -88,6 +88,12 @@ object SecuritySessionStore {
         establishedLink = null
     }
 
+    /** Compatibility hook used by the connection manager on link teardown. */
+    @Synchronized
+    fun reset() {
+        clearEstablishedLink()
+    }
+
     @Synchronized
     fun resetAll() {
         clearEstablishedLink()
