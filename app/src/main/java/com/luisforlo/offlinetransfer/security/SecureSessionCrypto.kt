@@ -141,7 +141,19 @@ object SecureSessionCrypto {
         verified: Boolean,
     ): ByteArray = hmacSha256(
         sessionKey,
-        "OTF-ACK|${Base64.getUrlEncoder().withoutPadding().encodeToString(sessionId)}|$sha256|$verified"
+        "OTF-ACK|${sessionIdText(sessionId)}|$sha256|$verified"
+            .toByteArray(Charsets.UTF_8),
+    )
+
+    fun resumeMac(
+        sessionKey: ByteArray,
+        sessionId: ByteArray,
+        sha256: String,
+        sizeBytes: Long,
+        resumeOffset: Long,
+    ): ByteArray = hmacSha256(
+        sessionKey,
+        "OTF-RESUME|${sessionIdText(sessionId)}|$sha256|$sizeBytes|$resumeOffset"
             .toByteArray(Charsets.UTF_8),
     )
 
@@ -152,15 +164,14 @@ object SecureSessionCrypto {
         direction: String,
     ): ByteArray = hmacSha256(
         sessionKey,
-        "OTF-HANDSHAKE|$direction|${Base64.getUrlEncoder().withoutPadding().encodeToString(sessionId)}|"
+        "OTF-HANDSHAKE|$direction|${sessionIdText(sessionId)}|"
             .toByteArray(Charsets.UTF_8) + senderPublicKeyBytes,
     )
 
     fun verificationCode(sessionKey: ByteArray, sessionId: ByteArray): String {
         val digest = hmacSha256(
             sessionKey,
-            "OTF-VERIFY|${Base64.getUrlEncoder().withoutPadding().encodeToString(sessionId)}"
-                .toByteArray(Charsets.UTF_8),
+            "OTF-VERIFY|${sessionIdText(sessionId)}".toByteArray(Charsets.UTF_8),
         )
         val value = ((digest[0].toInt() and 0xff) shl 16) or
             ((digest[1].toInt() and 0xff) shl 8) or
@@ -224,6 +235,9 @@ object SecureSessionCrypto {
         mac.init(SecretKeySpec(key, "HmacSHA256"))
         return mac.doFinal(data)
     }
+
+    private fun sessionIdText(sessionId: ByteArray): String =
+        Base64.getUrlEncoder().withoutPadding().encodeToString(sessionId)
 
     private fun randomBytes(size: Int): ByteArray = ByteArray(size).also(secureRandom::nextBytes)
 }
