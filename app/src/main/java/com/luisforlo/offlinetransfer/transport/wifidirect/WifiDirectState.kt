@@ -9,5 +9,7 @@ data class WifiDirectState(
     val connected: Boolean = false,
     val groupOwnerAddress: String? = null,
     val isGroupOwner: Boolean = false,
+    val thisDeviceName: String? = null,
+    val thisDeviceAddress: String? = null,
     val status: String = "Listo",
 )
