@@ -12,12 +12,16 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
@@ -37,8 +41,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.luisforlo.offlinetransfer.pairing.QrCodeGenerator
+import com.luisforlo.offlinetransfer.pairing.QrPairingPayload
+import com.luisforlo.offlinetransfer.pairing.QrScannerView
 import com.luisforlo.offlinetransfer.transfer.AndroidFileTransfer
 import com.luisforlo.offlinetransfer.transfer.TcpFileTransfer
 import com.luisforlo.offlinetransfer.transfer.TransferCancellation
@@ -112,6 +120,9 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     var desiredRole by remember { mutableStateOf(DesiredRole.SEND) }
     var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var permissionGranted by remember { mutableStateOf(hasNearbyPermission()) }
+    var cameraPermissionGranted by remember { mutableStateOf(hasCameraPermission()) }
+    var showQrScanner by remember { mutableStateOf(false) }
+    var qrMessage by remember { mutableStateOf<String?>(null) }
     var transferUi by remember { mutableStateOf(TransferUiState()) }
     var transferCancellation by remember { mutableStateOf<TransferCancellation?>(null) }
     var history by remember { mutableStateOf<List<TransferHistoryEntry>>(emptyList()) }
@@ -119,6 +130,14 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> permissionGranted = granted }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        cameraPermissionGranted = granted
+        showQrScanner = granted
+        if (!granted) qrMessage = "Se necesita permiso de cámara para escanear el QR."
+    }
 
     val filePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments(),
@@ -134,6 +153,18 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         }
     }
 
+    val localQrPayload = remember(state.thisDeviceAddress, state.thisDeviceName) {
+        state.thisDeviceAddress?.let { address ->
+            QrPairingPayload.create(
+                deviceAddress = address,
+                deviceName = state.thisDeviceName ?: "Android",
+            )
+        }
+    }
+    val localQrBitmap = remember(localQrPayload) {
+        localQrPayload?.let { QrCodeGenerator.create(it.encode()) }
+    }
+
     DisposableEffect(Unit) {
         wifiDirect.register()
         onDispose {
@@ -146,6 +177,13 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         if (!permissionGranted) permissionLauncher.launch(requiredNearbyPermission())
     }
 
+    LaunchedEffect(desiredRole, permissionGranted, state.connected) {
+        if (desiredRole == DesiredRole.RECEIVE && permissionGranted && !state.connected) {
+            wifiDirect.refreshThisDevice()
+            wifiDirect.discoverPeers()
+        }
+    }
+
     val transferBusy = transferUi.phase == TransferPhase.PREPARING ||
         transferUi.phase == TransferPhase.WAITING ||
         transferUi.phase == TransferPhase.TRANSFERRING
@@ -155,11 +193,18 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         transferCancellation = null
         selectedFiles = emptyList()
         history = emptyList()
+        showQrScanner = false
+        qrMessage = null
         transferUi = TransferUiState(message = "Sesión cerrada. Elige rol y dispositivo.")
         wifiDirect.disconnect()
     }
 
-    BackHandler(enabled = state.connected) {
+    BackHandler(enabled = showQrScanner) {
+        showQrScanner = false
+        qrMessage = null
+    }
+
+    BackHandler(enabled = state.connected && !showQrScanner) {
         resetAndDisconnect()
     }
 
@@ -397,7 +442,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("0.3.2-dev · roles elegibles + desconexión + Wi-Fi Direct optimizado")
+                Text("0.4.0-dev · emparejamiento QR + Wi-Fi Direct optimizado")
             }
 
             if (!state.connected) {
@@ -410,33 +455,118 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             Text("1. ¿Qué quieres hacer?", style = MaterialTheme.typography.titleMedium)
                             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 if (desiredRole == DesiredRole.SEND) {
-                                    Button(onClick = { desiredRole = DesiredRole.SEND }) {
-                                        Text("Enviar")
-                                    }
+                                    Button(onClick = {
+                                        desiredRole = DesiredRole.SEND
+                                        qrMessage = null
+                                    }) { Text("Enviar") }
                                 } else {
-                                    OutlinedButton(onClick = { desiredRole = DesiredRole.SEND }) {
-                                        Text("Enviar")
-                                    }
+                                    OutlinedButton(onClick = {
+                                        desiredRole = DesiredRole.SEND
+                                        qrMessage = null
+                                    }) { Text("Enviar") }
                                 }
 
                                 if (desiredRole == DesiredRole.RECEIVE) {
-                                    Button(onClick = { desiredRole = DesiredRole.RECEIVE }) {
-                                        Text("Recibir")
+                                    Button(onClick = {
+                                        desiredRole = DesiredRole.RECEIVE
+                                        qrMessage = null
+                                    }) { Text("Recibir") }
+                                } else {
+                                    OutlinedButton(onClick = {
+                                        desiredRole = DesiredRole.RECEIVE
+                                        qrMessage = null
+                                    }) { Text("Recibir") }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                item {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            if (desiredRole == DesiredRole.RECEIVE) {
+                                Text("2. Muestra este QR", style = MaterialTheme.typography.titleMedium)
+                                Text("El otro teléfono debe elegir Enviar y escanearlo.")
+
+                                if (localQrBitmap != null && localQrPayload != null) {
+                                    Image(
+                                        bitmap = localQrBitmap.asImageBitmap(),
+                                        contentDescription = "QR para emparejar Offline Transfer",
+                                        modifier = Modifier.size(260.dp),
+                                    )
+                                    Text(
+                                        state.thisDeviceName ?: "Este Android",
+                                        style = MaterialTheme.typography.titleSmall,
+                                    )
+                                    Text(
+                                        "QR listo · esperando al emisor…",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                } else {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                    Text("Preparando identidad Wi-Fi Direct…")
+                                    OutlinedButton(onClick = {
+                                        wifiDirect.refreshThisDevice()
+                                        wifiDirect.discoverPeers()
+                                    }) {
+                                        Text("Reintentar")
+                                    }
+                                }
+                            } else {
+                                Text("2. Escanea el QR del receptor", style = MaterialTheme.typography.titleMedium)
+                                Text("La app buscará y conectará automáticamente al teléfono correcto.")
+
+                                if (showQrScanner) {
+                                    QrScannerView(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(340.dp),
+                                        onQrText = { raw ->
+                                            val payload = QrPairingPayload.decode(raw)
+                                            if (payload == null) {
+                                                qrMessage = "Ese QR no pertenece a Offline Transfer."
+                                                showQrScanner = false
+                                            } else {
+                                                qrMessage = "QR de ${payload.deviceName} leído · conectando…"
+                                                showQrScanner = false
+                                                desiredRole = DesiredRole.SEND
+                                                wifiDirect.connectByAddress(
+                                                    deviceAddress = payload.deviceAddress,
+                                                    preferGroupOwner = false,
+                                                )
+                                            }
+                                        },
+                                        onError = { error ->
+                                            qrMessage = "Error de cámara: ${error.message ?: error.javaClass.simpleName}"
+                                        },
+                                    )
+                                    OutlinedButton(onClick = { showQrScanner = false }) {
+                                        Text("Cancelar escaneo")
                                     }
                                 } else {
-                                    OutlinedButton(onClick = { desiredRole = DesiredRole.RECEIVE }) {
-                                        Text("Recibir")
+                                    Button(
+                                        enabled = permissionGranted,
+                                        onClick = {
+                                            qrMessage = null
+                                            if (cameraPermissionGranted) {
+                                                showQrScanner = true
+                                            } else {
+                                                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                                            }
+                                        },
+                                    ) {
+                                        Text("Escanear QR")
                                     }
                                 }
                             }
-                            Text(
-                                if (desiredRole == DesiredRole.RECEIVE) {
-                                    "Este teléfono intentará convertirse en Group Owner para recibir."
-                                } else {
-                                    "Este teléfono intentará ser cliente para enviar al receptor."
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+
+                            qrMessage?.let {
+                                Text(it, style = MaterialTheme.typography.bodySmall)
+                            }
                         }
                     }
                 }
@@ -449,7 +579,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Text(
-                            if (state.connected) "Wi-Fi Direct" else "2. Elige dispositivo",
+                            if (state.connected) "Wi-Fi Direct" else "Conexión manual · respaldo",
                             style = MaterialTheme.typography.titleMedium,
                         )
                         Text(state.status)
@@ -471,36 +601,24 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                 style = MaterialTheme.typography.bodySmall,
                             )
 
-                            val roleMatches = (desiredRole == DesiredRole.RECEIVE) == actualReceiving
-                            if (!roleMatches) {
-                                Text(
-                                    "Android negoció el rol contrario al elegido. Puedes desconectar y volver a intentarlo.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
-                            }
-
                             OutlinedButton(
                                 enabled = !transferBusy,
                                 onClick = { resetAndDisconnect() },
                             ) {
                                 Text("Cambiar dispositivo / rol")
                             }
-                            Text(
-                                "También puedes usar el gesto o botón Atrás para volver a elegir.",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
                         } else {
-                            Button(
+                            OutlinedButton(
                                 enabled = permissionGranted && !transferBusy,
                                 onClick = { wifiDirect.discoverPeers() },
                             ) {
-                                Text(if (state.discovering) "Buscando…" else "Buscar dispositivos")
+                                Text(if (state.discovering) "Buscando…" else "Buscar manualmente")
                             }
                             if (!permissionGranted) {
                                 OutlinedButton(
                                     onClick = { permissionLauncher.launch(requiredNearbyPermission()) },
                                 ) {
-                                    Text("Dar permiso")
+                                    Text("Dar permiso Wi-Fi")
                                 }
                             }
                         }
@@ -508,10 +626,8 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                 }
             }
 
-            if (state.peers.isNotEmpty() && !state.connected) {
-                item {
-                    Text("Dispositivos encontrados", style = MaterialTheme.typography.titleMedium)
-                }
+            if (state.peers.isNotEmpty() && !state.connected && !showQrScanner) {
+                item { Text("Dispositivos encontrados", style = MaterialTheme.typography.titleMedium) }
                 items(state.peers, key = { it.deviceAddress }) { peer ->
                     Card(Modifier.fillMaxWidth()) {
                         Column(
@@ -531,13 +647,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                     )
                                 },
                             ) {
-                                Text(
-                                    if (desiredRole == DesiredRole.RECEIVE) {
-                                        "Conectar para recibir"
-                                    } else {
-                                        "Conectar para enviar"
-                                    },
-                                )
+                                Text(if (desiredRole == DesiredRole.RECEIVE) "Conectar para recibir" else "Conectar para enviar")
                             }
                         }
                     }
@@ -562,24 +672,15 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             OutlinedButton(
                                 enabled = !transferBusy,
                                 onClick = { filePicker.launch(arrayOf("*/*")) },
-                            ) {
-                                Text("Seleccionar archivos")
-                            }
+                            ) { Text("Seleccionar archivos") }
                             Button(
-                                enabled = selectedFiles.isNotEmpty() &&
-                                    state.groupOwnerAddress != null &&
-                                    !transferBusy,
+                                enabled = selectedFiles.isNotEmpty() && state.groupOwnerAddress != null && !transferBusy,
                                 onClick = {
-                                    val host = state.groupOwnerAddress
-                                    if (host != null) sendFiles(selectedFiles, host)
+                                    state.groupOwnerAddress?.let { sendFiles(selectedFiles, it) }
                                 },
-                            ) {
-                                Text("Enviar ahora")
-                            }
+                            ) { Text("Enviar ahora") }
                             if (transferBusy) {
-                                OutlinedButton(onClick = { stopTransfer() }) {
-                                    Text("Cancelar envío")
-                                }
+                                OutlinedButton(onClick = { stopTransfer() }) { Text("Cancelar envío") }
                             }
                         }
                     }
@@ -596,13 +697,9 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             Text("Recibir archivos", style = MaterialTheme.typography.titleMedium)
                             Text("La sesión queda escuchando para recibir varios archivos consecutivos.")
                             if (transferBusy) {
-                                OutlinedButton(onClick = { stopTransfer() }) {
-                                    Text("Detener recepción")
-                                }
+                                OutlinedButton(onClick = { stopTransfer() }) { Text("Detener recepción") }
                             } else {
-                                Button(onClick = { startReceiveSession() }) {
-                                    Text("Iniciar recepción")
-                                }
+                                Button(onClick = { startReceiveSession() }) { Text("Iniciar recepción") }
                             }
                             Text(
                                 "Los archivos verificados se guardan en Descargas/Offline Transfer.",
@@ -622,10 +719,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                         ) {
                             Text("Transferencia", style = MaterialTheme.typography.titleMedium)
                             Text(transferUi.message)
-
-                            transferUi.currentFile?.let { fileName ->
-                                Text(fileName, style = MaterialTheme.typography.bodyMedium)
-                            }
+                            transferUi.currentFile?.let { Text(it) }
 
                             if (transferUi.fileCount > 0) {
                                 Text(
@@ -637,9 +731,8 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             }
 
                             if (transferUi.bytesTotal > 0L) {
-                                val progress = (
-                                    transferUi.bytesDone.toFloat() / transferUi.bytesTotal.toFloat()
-                                    ).coerceIn(0f, 1f)
+                                val progress = (transferUi.bytesDone.toFloat() / transferUi.bytesTotal.toFloat())
+                                    .coerceIn(0f, 1f)
                                 LinearProgressIndicator(
                                     progress = { progress },
                                     modifier = Modifier.fillMaxWidth(),
@@ -660,9 +753,9 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                 )
                             }
 
-                            transferUi.diagnostics?.let { diagnostics ->
+                            transferUi.diagnostics?.let {
                                 Text("Diagnóstico", style = MaterialTheme.typography.titleSmall)
-                                Text(diagnostics, style = MaterialTheme.typography.bodySmall)
+                                Text(it, style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
@@ -670,9 +763,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
             }
 
             if (history.isNotEmpty()) {
-                item {
-                    Text("Historial de esta sesión", style = MaterialTheme.typography.titleMedium)
-                }
+                item { Text("Historial de esta sesión", style = MaterialTheme.typography.titleMedium) }
                 items(history.take(12), key = { it.id }) { entry ->
                     Card(Modifier.fillMaxWidth()) {
                         Column(
@@ -696,6 +787,9 @@ private fun ComponentActivity.requiredNearbyPermission(): String =
 
 private fun ComponentActivity.hasNearbyPermission(): Boolean =
     ContextCompat.checkSelfPermission(this, requiredNearbyPermission()) == PackageManager.PERMISSION_GRANTED
+
+private fun ComponentActivity.hasCameraPermission(): Boolean =
+    ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
 private fun formatPerformance(
     result: TcpFileTransfer.Result,
@@ -724,7 +818,6 @@ private fun formatPerformance(
 
 private fun formatBytes(bytes: Long): String {
     if (bytes < 1024L) return "$bytes B"
-
     val units = arrayOf("KB", "MB", "GB", "TB")
     var value = bytes.toDouble()
     var unitIndex = -1
