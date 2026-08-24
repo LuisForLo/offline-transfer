@@ -2,7 +2,7 @@ package com.luisforlo.offlinetransfer.security
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFailsWith
+import org.junit.Assert.fail
 import org.junit.Test
 
 class SecureSessionCryptoTest {
@@ -52,7 +52,7 @@ class SecureSessionCryptoTest {
         assertArrayEquals(plain, decrypted)
 
         encrypted[encrypted.lastIndex / 2] = (encrypted[encrypted.lastIndex / 2].toInt() xor 0x01).toByte()
-        assertFailsWith<Throwable> {
+        try {
             SecureSessionCrypto.decryptChunk(
                 sessionKey = link.sessionKey,
                 sessionId = link.sessionId,
@@ -60,6 +60,9 @@ class SecureSessionCryptoTest {
                 counter = 7,
                 ciphertext = encrypted,
             )
+            fail("Tampered AES-GCM ciphertext must be rejected")
+        } catch (_: Throwable) {
+            // Expected: AEAD authentication failure.
         }
     }
 }
