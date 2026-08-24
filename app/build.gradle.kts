@@ -33,8 +33,8 @@ android {
         applicationId = "com.luisforlo.offlinetransfer"
         minSdk = 26
         targetSdk = 37
-        versionCode = 8
-        versionName = "0.4.0-dev"
+        versionCode = 9
+        versionName = "0.5.0-dev"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

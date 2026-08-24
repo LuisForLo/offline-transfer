@@ -15,9 +15,12 @@ import android.os.Looper
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import com.luisforlo.offlinetransfer.pairing.QrPairingRegistry
+import com.luisforlo.offlinetransfer.security.SecuritySessionStore
+import com.luisforlo.offlinetransfer.transfer.TransferCancellation
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.net.SocketTimeoutException
 
 class WifiDirectManager(context: Context) {
     private val appContext = context.applicationContext
@@ -25,6 +28,7 @@ class WifiDirectManager(context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = manager.initialize(appContext, Looper.getMainLooper()) {
         clearPendingTarget()
+        cancelSecurityHandshake(resetSecurity = true)
         resetDisconnected("Canal Wi‑Fi Direct perdido")
     }
 
@@ -37,6 +41,8 @@ class WifiDirectManager(context: Context) {
     private var pendingPreferGroupOwner = false
     private var targetSearchStartedAt = 0L
     private var targetSearchAttempt = 0
+    private var securityCancellation: TransferCancellation? = null
+    private var securityGeneration = 0
 
     private val targetRetry = Runnable {
         if (pendingTargetAddress != null && !_state.value.connected) {
@@ -71,6 +77,7 @@ class WifiDirectManager(context: Context) {
                         update { copy(status = status.takeUnless { it.startsWith("QR leído") } ?: status) }
                     } else {
                         clearPendingTarget()
+                        cancelSecurityHandshake(resetSecurity = true)
                         resetDisconnected("Desconectado")
                     }
                 }
@@ -111,6 +118,7 @@ class WifiDirectManager(context: Context) {
 
     fun unregister() {
         mainHandler.removeCallbacks(targetRetry)
+        cancelSecurityHandshake(resetSecurity = true)
         if (!receiverRegistered) return
         appContext.unregisterReceiver(receiver)
         receiverRegistered = false
@@ -188,14 +196,10 @@ class WifiDirectManager(context: Context) {
             }
 
             override fun onFailure(reason: Int) {
-                // BUSY is common while a previous discovery cycle is still active.
-                // Read the current peer cache anyway before retrying.
                 requestPeers()
                 if (reason != WifiP2pManager.BUSY) {
                     update {
-                        copy(
-                            status = "QR leído · reintentando búsqueda (${reasonText(reason)})…",
-                        )
+                        copy(status = "QR leído · reintentando búsqueda (${reasonText(reason)})…")
                     }
                 }
             }
@@ -230,6 +234,7 @@ class WifiDirectManager(context: Context) {
     @SuppressLint("MissingPermission")
     fun disconnect() {
         clearPendingTarget()
+        cancelSecurityHandshake(resetSecurity = true)
         update { copy(status = "Desconectando…", discovering = false) }
         runCatching {
             manager.stopPeerDiscovery(channel, object : WifiP2pManager.ActionListener {
@@ -276,9 +281,6 @@ class WifiDirectManager(context: Context) {
             } else {
                 emptyList()
             }
-
-            // Only use the name fallback when it uniquely identifies one peer.
-            // This prevents connecting to the wrong phone in a crowded area.
             val target = addressMatch ?: nameMatches.singleOrNull()
 
             if (target != null) {
@@ -356,15 +358,95 @@ class WifiDirectManager(context: Context) {
     private fun requestConnectionInfo() {
         manager.requestConnectionInfo(channel) { info ->
             clearPendingTarget()
+            val formed = info.groupFormed
+            val host = info.groupOwnerAddress?.hostAddress
             update {
                 copy(
-                    connected = info.groupFormed,
-                    groupOwnerAddress = info.groupOwnerAddress?.hostAddress,
+                    connected = formed,
+                    groupOwnerAddress = host,
                     isGroupOwner = info.isGroupOwner,
                     discovering = false,
-                    status = if (info.groupFormed) "Conexión Wi‑Fi Direct lista" else "Negociando grupo…",
+                    secureLinkEstablished = false,
+                    securityVerificationCode = null,
+                    status = if (formed) "Conexión Wi‑Fi Direct lista · preparando seguridad…" else "Negociando grupo…",
                 )
             }
+            if (formed && host != null) {
+                startSecurityHandshake(info.isGroupOwner, host)
+            }
+        }
+    }
+
+    private fun startSecurityHandshake(isGroupOwner: Boolean, host: String) {
+        cancelSecurityHandshake(resetSecurity = false)
+        val hasSecurityContext = if (isGroupOwner) {
+            SecuritySessionStore.hasReceiverSession()
+        } else {
+            SecuritySessionStore.hasSenderSession()
+        }
+
+        if (!hasSecurityContext) {
+            update {
+                copy(
+                    secureLinkEstablished = false,
+                    securityVerificationCode = null,
+                    status = "Conexión Wi‑Fi Direct lista · conexión manual",
+                )
+            }
+            return
+        }
+
+        val cancellation = TransferCancellation()
+        securityCancellation = cancellation
+        val generation = ++securityGeneration
+        update { copy(status = "Conexión Wi‑Fi Direct lista · negociando cifrado E2E…") }
+
+        Thread({
+            try {
+                val link = if (isGroupOwner) {
+                    SecuritySessionStore.establishAsReceiver(cancellation)
+                } else {
+                    SecuritySessionStore.establishAsSender(host, cancellation)
+                }
+                mainHandler.post {
+                    if (generation == securityGeneration && _state.value.connected) {
+                        update {
+                            copy(
+                                secureLinkEstablished = true,
+                                securityVerificationCode = link.verificationCode,
+                                status = "🔒 E2E activo · código ${link.verificationCode} · verifica que coincida en ambos",
+                            )
+                        }
+                    }
+                }
+            } catch (error: Throwable) {
+                if (cancellation.isCancelled) return@Thread
+                mainHandler.post {
+                    if (generation == securityGeneration && _state.value.connected) {
+                        val manualFallback = isGroupOwner && error is SocketTimeoutException
+                        update {
+                            copy(
+                                secureLinkEstablished = false,
+                                securityVerificationCode = null,
+                                status = if (manualFallback) {
+                                    "Conexión Wi‑Fi Direct lista · sin QR seguro (modo manual)"
+                                } else {
+                                    "⚠ No se pudo establecer cifrado E2E: ${error.message ?: error.javaClass.simpleName}"
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }, "offline-transfer-secure-handshake").start()
+    }
+
+    private fun cancelSecurityHandshake(resetSecurity: Boolean) {
+        securityGeneration++
+        securityCancellation?.cancel()
+        securityCancellation = null
+        if (resetSecurity) {
+            SecuritySessionStore.reset()
         }
     }
 
@@ -398,6 +480,8 @@ class WifiDirectManager(context: Context) {
                 connected = false,
                 groupOwnerAddress = null,
                 isGroupOwner = false,
+                secureLinkEstablished = false,
+                securityVerificationCode = null,
                 status = status,
             )
         }

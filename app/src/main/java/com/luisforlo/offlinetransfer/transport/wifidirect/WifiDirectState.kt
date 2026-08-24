@@ -11,5 +11,7 @@ data class WifiDirectState(
     val isGroupOwner: Boolean = false,
     val thisDeviceName: String? = null,
     val thisDeviceAddress: String? = null,
+    val secureLinkEstablished: Boolean = false,
+    val securityVerificationCode: String? = null,
     val status: String = "Listo",
 )

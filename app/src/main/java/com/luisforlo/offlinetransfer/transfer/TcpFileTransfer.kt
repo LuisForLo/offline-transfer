@@ -31,6 +31,8 @@ object TcpFileTransfer {
         val publishElapsedMillis: Long = 0L,
         val effectiveSendBufferBytes: Int = 0,
         val effectiveReceiveBufferBytes: Int = 0,
+        val encrypted: Boolean = false,
+        val securityVerificationCode: String? = null,
     ) {
         val bytesPerSecond: Double
             get() = if (transferElapsedMillis > 0L) {

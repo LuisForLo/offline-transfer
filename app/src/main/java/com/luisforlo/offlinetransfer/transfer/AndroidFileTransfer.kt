@@ -9,6 +9,8 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import com.luisforlo.offlinetransfer.protocol.TransferHeader
+import com.luisforlo.offlinetransfer.security.SecuritySessionStore
+import com.luisforlo.offlinetransfer.security.SecureSessionCrypto
 import java.io.File
 
 object AndroidFileTransfer {
@@ -47,6 +49,7 @@ object AndroidFileTransfer {
         context: Context,
         uri: Uri,
         host: String,
+        secureLink: SecureSessionCrypto.SecureLink? = null,
         cancellation: TransferCancellation? = null,
         onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
     ): TcpFileTransfer.Result {
@@ -68,31 +71,59 @@ object AndroidFileTransfer {
             sha256 = sha256,
         )
 
-        return TcpFileTransfer.send(
-            host = host,
-            header = header,
-            inputFactory = {
-                resolver.openInputStream(uri)
-                    ?: error("No se pudo volver a abrir el archivo para enviarlo")
-            },
-            cancellation = cancellation,
-            onProgress = onProgress,
-        ).copy(preparationElapsedMillis = hashElapsedMillis)
+        val effectiveSecureLink = secureLink ?: SecuritySessionStore.linkForSend()
+        val result = if (effectiveSecureLink != null) {
+            SecureTcpFileTransfer.send(
+                host = host,
+                link = effectiveSecureLink,
+                header = header,
+                inputFactory = {
+                    resolver.openInputStream(uri)
+                        ?: error("No se pudo volver a abrir el archivo para enviarlo")
+                },
+                cancellation = cancellation,
+                onProgress = onProgress,
+            )
+        } else {
+            TcpFileTransfer.send(
+                host = host,
+                header = header,
+                inputFactory = {
+                    resolver.openInputStream(uri)
+                        ?: error("No se pudo volver a abrir el archivo para enviarlo")
+                },
+                cancellation = cancellation,
+                onProgress = onProgress,
+            )
+        }
+
+        return result.copy(preparationElapsedMillis = hashElapsedMillis)
     }
 
     fun receiveAndSave(
         context: Context,
+        secureLink: SecureSessionCrypto.SecureLink? = null,
         cancellation: TransferCancellation? = null,
         onProgress: (received: Long, total: Long) -> Unit = { _, _ -> },
     ): SavedResult {
         val temporary = File.createTempFile("offline-transfer-", ".part", context.cacheDir)
 
         try {
-            val result = TcpFileTransfer.receive(
-                destination = temporary,
-                cancellation = cancellation,
-                onProgress = onProgress,
-            )
+            val effectiveSecureLink = secureLink ?: SecuritySessionStore.linkForReceive()
+            val result = if (effectiveSecureLink != null) {
+                SecureTcpFileTransfer.receive(
+                    destination = temporary,
+                    link = effectiveSecureLink,
+                    cancellation = cancellation,
+                    onProgress = onProgress,
+                )
+            } else {
+                TcpFileTransfer.receive(
+                    destination = temporary,
+                    cancellation = cancellation,
+                    onProgress = onProgress,
+                )
+            }
             cancellation?.throwIfCancelled()
             check(result.verified) { "SHA-256 no coincide; el archivo recibido fue descartado" }
 
