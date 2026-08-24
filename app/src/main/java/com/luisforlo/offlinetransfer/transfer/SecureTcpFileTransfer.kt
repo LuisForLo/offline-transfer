@@ -27,6 +27,7 @@ object SecureTcpFileTransfer {
     private const val CONNECT_RETRY_DELAY_MS = 300L
     private const val MAX_HEADER_PLAINTEXT = 64 * 1024
     private const val MAX_CIPHERTEXT_FRAME = TcpFileTransfer.STREAM_BUFFER_SIZE + 64
+    private const val DURABLE_SYNC_INTERVAL_BYTES = 16L * 1024L * 1024L
 
     data class ReceiveResult(
         val transfer: TcpFileTransfer.Result,
@@ -294,9 +295,11 @@ object SecureTcpFileTransfer {
         var received = resumeOffset
         var networkReceived = 0L
         var expectedCounter = 1
+        var lastDurableSyncAt = resumeOffset
 
         FileOutputStream(destination, resumeOffset > 0L).use { rawOutput ->
-            BufferedOutputStream(rawOutput, TcpFileTransfer.STREAM_BUFFER_SIZE).use { fileOutput ->
+            val fileOutput = BufferedOutputStream(rawOutput, TcpFileTransfer.STREAM_BUFFER_SIZE)
+            try {
                 while (received < header.sizeBytes) {
                     cancellation?.throwIfCancelled()
                     val frame = readEncryptedFrame(input, TcpFileTransfer.STREAM_BUFFER_SIZE)
@@ -313,9 +316,19 @@ object SecureTcpFileTransfer {
                     fileOutput.write(plain)
                     received += plain.size
                     networkReceived += plain.size
+
+                    // Make resume progress durable even if Android kills the process abruptly.
+                    if (received - lastDurableSyncAt >= DURABLE_SYNC_INTERVAL_BYTES) {
+                        fileOutput.flush()
+                        rawOutput.fd.sync()
+                        lastDurableSyncAt = received
+                    }
                     onProgress(received, header.sizeBytes)
                 }
-                fileOutput.flush()
+            } finally {
+                // Cancellation/process teardown must leave the largest possible valid prefix on disk.
+                runCatching { fileOutput.flush() }
+                runCatching { rawOutput.fd.sync() }
             }
         }
 

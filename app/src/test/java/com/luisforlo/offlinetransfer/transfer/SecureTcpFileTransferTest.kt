@@ -107,6 +107,90 @@ class SecureTcpFileTransferTest {
         }
     }
 
+    @Test
+    fun interruptedTransferResumesAcrossFreshE2eSession() {
+        val payload = ByteArray(6_500_000) { ((it * 29 + 7) % 251).toByte() }
+        val header = headerFor(payload, "restart-resume.bin")
+        val destination = File.createTempFile("secure-process-restart-", ".part")
+        destination.delete()
+        val firstPort = ServerSocket(0).use { it.localPort }
+        val firstExecutor = Executors.newSingleThreadExecutor()
+        val receiverCancellation = TransferCancellation()
+        val (firstSenderLink, firstReceiverLink) = secureLinks()
+
+        try {
+            val firstReceive = firstExecutor.submit {
+                runCatching {
+                    SecureTcpFileTransfer.receiveResumable(
+                        link = firstReceiverLink,
+                        destinationFor = { destination },
+                        port = firstPort,
+                        cancellation = receiverCancellation,
+                        onProgress = { received, _ ->
+                            if (received >= 2_100_000L) receiverCancellation.cancel()
+                        },
+                    )
+                }
+            }
+
+            Thread.sleep(100L)
+            runCatching {
+                SecureTcpFileTransfer.send(
+                    host = "127.0.0.1",
+                    link = firstSenderLink,
+                    header = header,
+                    inputFactory = { payload.inputStream() },
+                    port = firstPort,
+                )
+            }
+            firstReceive.get(20, TimeUnit.SECONDS)
+
+            val persistedPrefix = destination.length()
+            assertTrue("partial should survive interruption", persistedPrefix > 0L)
+            assertTrue("partial must be incomplete", persistedPrefix < payload.size.toLong())
+
+            // Simulate a process/app restart: entirely new QR/ECDH session and a fresh server.
+            val (secondSenderLink, secondReceiverLink) = secureLinks()
+            val secondPort = ServerSocket(0).use { it.localPort }
+            val secondExecutor = Executors.newSingleThreadExecutor()
+            try {
+                val secondReceive = secondExecutor.submit<SecureTcpFileTransfer.ReceiveResult> {
+                    SecureTcpFileTransfer.receiveResumable(
+                        link = secondReceiverLink,
+                        destinationFor = { destination },
+                        port = secondPort,
+                    )
+                }
+
+                Thread.sleep(100L)
+                val secondSend = SecureTcpFileTransfer.send(
+                    host = "127.0.0.1",
+                    link = secondSenderLink,
+                    header = header,
+                    inputFactory = { payload.inputStream() },
+                    port = secondPort,
+                )
+                val secondReceiveResult = secondReceive.get(20, TimeUnit.SECONDS).transfer
+
+                assertTrue(secondSend.verified)
+                assertTrue(secondReceiveResult.verified)
+                assertEquals(persistedPrefix, secondSend.resumedFromBytes)
+                assertEquals(persistedPrefix, secondReceiveResult.resumedFromBytes)
+                assertEquals(
+                    payload.size.toLong() - persistedPrefix,
+                    secondSend.networkBytesTransferred,
+                )
+                assertArrayEquals(payload, destination.readBytes())
+            } finally {
+                secondExecutor.shutdownNow()
+            }
+        } finally {
+            receiverCancellation.cancel()
+            firstExecutor.shutdownNow()
+            destination.delete()
+        }
+    }
+
     private fun headerFor(payload: ByteArray, name: String): TransferHeader {
         val sha = MessageDigest.getInstance("SHA-256")
             .digest(payload)
