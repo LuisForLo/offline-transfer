@@ -42,7 +42,13 @@ data class QrPairingPayload(
             val nonce = parts[3].trim()
             if (nonce.length !in 8..64) return null
 
-            return QrPairingPayload(address, name.ifBlank { "Android" }, nonce)
+            val payload = QrPairingPayload(
+                deviceAddress = address,
+                deviceName = name.ifBlank { "Android" },
+                nonce = nonce,
+            )
+            QrPairingRegistry.remember(payload.deviceAddress, payload.deviceName)
+            return payload
         }
     }
 }
