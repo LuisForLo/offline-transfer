@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -66,6 +67,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private enum class DesiredRole {
+    SEND,
+    RECEIVE,
+}
+
 private enum class TransferPhase {
     IDLE,
     PREPARING,
@@ -102,6 +108,8 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     val activity = this
     val scope = rememberCoroutineScope()
     val state by wifiDirect.state.collectAsState()
+
+    var desiredRole by remember { mutableStateOf(DesiredRole.SEND) }
     var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var permissionGranted by remember { mutableStateOf(hasNearbyPermission()) }
     var transferUi by remember { mutableStateOf(TransferUiState()) }
@@ -141,6 +149,19 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     val transferBusy = transferUi.phase == TransferPhase.PREPARING ||
         transferUi.phase == TransferPhase.WAITING ||
         transferUi.phase == TransferPhase.TRANSFERRING
+
+    fun resetAndDisconnect() {
+        transferCancellation?.cancel()
+        transferCancellation = null
+        selectedFiles = emptyList()
+        history = emptyList()
+        transferUi = TransferUiState(message = "Sesión cerrada. Elige rol y dispositivo.")
+        wifiDirect.disconnect()
+    }
+
+    BackHandler(enabled = state.connected) {
+        resetAndDisconnect()
+    }
 
     fun stopTransfer() {
         transferUi = transferUi.copy(message = "Cancelando transferencia…")
@@ -376,7 +397,49 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("0.3.1-dev · Wi-Fi Direct + buffers optimizados + diagnóstico")
+                Text("0.3.2-dev · roles elegibles + desconexión + Wi-Fi Direct optimizado")
+            }
+
+            if (!state.connected) {
+                item {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Text("1. ¿Qué quieres hacer?", style = MaterialTheme.typography.titleMedium)
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                if (desiredRole == DesiredRole.SEND) {
+                                    Button(onClick = { desiredRole = DesiredRole.SEND }) {
+                                        Text("Enviar")
+                                    }
+                                } else {
+                                    OutlinedButton(onClick = { desiredRole = DesiredRole.SEND }) {
+                                        Text("Enviar")
+                                    }
+                                }
+
+                                if (desiredRole == DesiredRole.RECEIVE) {
+                                    Button(onClick = { desiredRole = DesiredRole.RECEIVE }) {
+                                        Text("Recibir")
+                                    }
+                                } else {
+                                    OutlinedButton(onClick = { desiredRole = DesiredRole.RECEIVE }) {
+                                        Text("Recibir")
+                                    }
+                                }
+                            }
+                            Text(
+                                if (desiredRole == DesiredRole.RECEIVE) {
+                                    "Este teléfono intentará convertirse en Group Owner para recibir."
+                                } else {
+                                    "Este teléfono intentará ser cliente para enviar al receptor."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                }
             }
 
             item {
@@ -385,13 +448,17 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                         Modifier.padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        Text("Wi-Fi Direct", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            if (state.connected) "Wi-Fi Direct" else "2. Elige dispositivo",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
                         Text(state.status)
                         Text(if (state.enabled) "P2P disponible" else "P2P no disponible o desactivado")
 
                         if (state.connected) {
+                            val actualReceiving = state.isGroupOwner
                             Text(
-                                if (state.isGroupOwner) {
+                                if (actualReceiving) {
                                     "MODO RECEPTOR · recepción continua"
                                 } else {
                                     "MODO EMISOR · uno o varios archivos"
@@ -403,14 +470,31 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                 "Perfil TCP: chunks 1 MiB · buffer solicitado 4 MiB",
                                 style = MaterialTheme.typography.bodySmall,
                             )
-                        }
 
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            val roleMatches = (desiredRole == DesiredRole.RECEIVE) == actualReceiving
+                            if (!roleMatches) {
+                                Text(
+                                    "Android negoció el rol contrario al elegido. Puedes desconectar y volver a intentarlo.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+
+                            OutlinedButton(
+                                enabled = !transferBusy,
+                                onClick = { resetAndDisconnect() },
+                            ) {
+                                Text("Cambiar dispositivo / rol")
+                            }
+                            Text(
+                                "También puedes usar el gesto o botón Atrás para volver a elegir.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        } else {
                             Button(
                                 enabled = permissionGranted && !transferBusy,
                                 onClick = { wifiDirect.discoverPeers() },
                             ) {
-                                Text(if (state.discovering) "Buscando…" else "Buscar")
+                                Text(if (state.discovering) "Buscando…" else "Buscar dispositivos")
                             }
                             if (!permissionGranted) {
                                 OutlinedButton(
@@ -425,7 +509,9 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
             }
 
             if (state.peers.isNotEmpty() && !state.connected) {
-                item { Text("Dispositivos encontrados", style = MaterialTheme.typography.titleMedium) }
+                item {
+                    Text("Dispositivos encontrados", style = MaterialTheme.typography.titleMedium)
+                }
                 items(state.peers, key = { it.deviceAddress }) { peer ->
                     Card(Modifier.fillMaxWidth()) {
                         Column(
@@ -438,9 +524,20 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             Text(peer.deviceAddress, style = MaterialTheme.typography.bodySmall)
                             Button(
                                 enabled = !transferBusy,
-                                onClick = { wifiDirect.connect(peer) },
+                                onClick = {
+                                    wifiDirect.connect(
+                                        device = peer,
+                                        preferGroupOwner = desiredRole == DesiredRole.RECEIVE,
+                                    )
+                                },
                             ) {
-                                Text("Conectar")
+                                Text(
+                                    if (desiredRole == DesiredRole.RECEIVE) {
+                                        "Conectar para recibir"
+                                    } else {
+                                        "Conectar para enviar"
+                                    },
+                                )
                             }
                         }
                     }
