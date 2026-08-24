@@ -40,6 +40,7 @@ object SecuritySessionStore {
 
     fun hasReceiverSession(): Boolean = receiverSession != null
     fun hasSenderSession(): Boolean = senderSession != null
+    fun expectsSecureSend(): Boolean = senderSession != null
 
     fun establishAsReceiver(cancellation: TransferCancellation? = null): SecureSessionCrypto.SecureLink {
         val receiver = requireNotNull(receiverSession) { "Secure receiver session is not prepared" }
@@ -59,6 +60,26 @@ object SecuritySessionStore {
     }
 
     fun linkOrNull(): SecureSessionCrypto.SecureLink? = establishedLink
+
+    fun linkForSend(): SecureSessionCrypto.SecureLink? {
+        val link = establishedLink
+        if (senderSession != null && link == null) {
+            error("La sesión QR segura aún no termina su handshake")
+        }
+        return link
+    }
+
+    fun linkForReceive(waitMillis: Long = 7_500L): SecureSessionCrypto.SecureLink? {
+        establishedLink?.let { return it }
+        if (receiverSession == null) return null
+
+        val deadline = System.nanoTime() + waitMillis * 1_000_000L
+        while (System.nanoTime() < deadline) {
+            establishedLink?.let { return it }
+            Thread.sleep(50L)
+        }
+        return establishedLink
+    }
 
     fun verificationCodeOrNull(): String? = establishedLink?.verificationCode
 
