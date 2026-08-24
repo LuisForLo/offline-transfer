@@ -42,7 +42,19 @@ object SecureSessionCrypto {
             get() = keyPair.public.encoded
         val verificationCode: String
             get() = verificationCode(sessionKey, sessionId)
+
+        fun asSecureLink(): SecureLink = SecureLink(
+            sessionId = sessionId.copyOf(),
+            sessionKey = sessionKey.copyOf(),
+            verificationCode = verificationCode,
+        )
     }
+
+    data class SecureLink(
+        val sessionId: ByteArray,
+        val sessionKey: ByteArray,
+        val verificationCode: String,
+    )
 
     fun createReceiverSession(): ReceiverSession = ReceiverSession(
         sessionId = randomBytes(16),
@@ -67,15 +79,20 @@ object SecureSessionCrypto {
         return SenderSession(sessionId, keyPair, receiverPublicKey, key)
     }
 
-    fun deriveReceiverKey(
+    fun deriveReceiverLink(
         receiverSession: ReceiverSession,
         senderPublicKeyBytes: ByteArray,
-    ): ByteArray {
+    ): SecureLink {
         val senderPublicKey = decodePublicKey(senderPublicKeyBytes)
-        return deriveSessionKey(
+        val key = deriveSessionKey(
             ownPrivate = receiverSession.keyPair.private,
             peerPublic = senderPublicKey,
             sessionId = receiverSession.sessionId,
+        )
+        return SecureLink(
+            sessionId = receiverSession.sessionId.copyOf(),
+            sessionKey = key,
+            verificationCode = verificationCode(key, receiverSession.sessionId),
         )
     }
 
@@ -126,6 +143,17 @@ object SecureSessionCrypto {
         sessionKey,
         "OTF-ACK|${Base64.getUrlEncoder().withoutPadding().encodeToString(sessionId)}|$sha256|$verified"
             .toByteArray(Charsets.UTF_8),
+    )
+
+    fun handshakeMac(
+        sessionKey: ByteArray,
+        sessionId: ByteArray,
+        senderPublicKeyBytes: ByteArray,
+        direction: String,
+    ): ByteArray = hmacSha256(
+        sessionKey,
+        "OTF-HANDSHAKE|$direction|${Base64.getUrlEncoder().withoutPadding().encodeToString(sessionId)}|"
+            .toByteArray(Charsets.UTF_8) + senderPublicKeyBytes,
     )
 
     fun verificationCode(sessionKey: ByteArray, sessionId: ByteArray): String {
