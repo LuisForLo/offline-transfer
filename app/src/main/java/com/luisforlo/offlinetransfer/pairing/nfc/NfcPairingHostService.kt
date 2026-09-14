@@ -7,6 +7,7 @@ import java.nio.ByteBuffer
 class NfcPairingHostService : HostApduService() {
     override fun processCommandApdu(commandApdu: ByteArray, extras: Bundle?): ByteArray {
         if (NfcPairingProtocol.isSelectAid(commandApdu)) {
+            NfcPairingStore.markAidSelected()
             return if (NfcPairingStore.current() != null) {
                 NfcPairingProtocol.SW_OK
             } else {
@@ -32,8 +33,11 @@ class NfcPairingHostService : HostApduService() {
             payload.size,
             offset + requested.coerceAtMost(NfcPairingProtocol.MAX_CHUNK_BYTES),
         )
+        NfcPairingStore.markPayloadRead(end, payload.size)
         return NfcPairingProtocol.appendStatus(payload.copyOfRange(offset, end))
     }
 
-    override fun onDeactivated(reason: Int) = Unit
+    override fun onDeactivated(reason: Int) {
+        NfcPairingStore.markDeactivated()
+    }
 }
