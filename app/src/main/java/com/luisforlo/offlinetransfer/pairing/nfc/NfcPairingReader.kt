@@ -39,7 +39,7 @@ class NfcPairingReader(
     }
 
     fun disable() {
-        if (!active.getAndSet(false)) return
+        active.set(false)
         runCatching { adapter?.disableReaderMode(activity) }
     }
 
@@ -49,6 +49,7 @@ class NfcPairingReader(
         onError: (Throwable) -> Unit,
     ) {
         if (!active.compareAndSet(true, false)) return
+        runCatching { adapter?.disableReaderMode(activity) }
 
         try {
             val isoDep = IsoDep.get(tag) ?: error("El otro dispositivo no expuso ISO-DEP")
