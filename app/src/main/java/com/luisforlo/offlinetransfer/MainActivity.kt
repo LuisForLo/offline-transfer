@@ -249,7 +249,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("0.8.1-dev · NFC reforzado + QR + E2E")
+                Text("0.8.2-dev · NFC estable + QR + E2E")
             }
 
             if (transferBusy) {
@@ -367,7 +367,10 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                                 runCatching {
                                                     nfcReader.enable(
                                                         onTagDetected = {
-                                                            nfcMessage = "NFC detectado · seleccionando Offline Transfer…"
+                                                            nfcMessage = "NFC detectado · mantén los teléfonos juntos…"
+                                                        },
+                                                        onStage = { stage ->
+                                                            nfcMessage = stage
                                                         },
                                                         onPayload = { raw -> connectFromPairingPayload(raw, "NFC") },
                                                         onError = { error ->
