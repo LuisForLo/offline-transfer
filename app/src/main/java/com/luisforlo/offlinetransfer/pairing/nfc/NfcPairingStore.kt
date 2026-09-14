@@ -34,6 +34,7 @@ object NfcPairingStore {
     }
 
     fun markDeactivated() {
+        if (_status.value.startsWith("NFC leído")) return
         if (payload != null) {
             _status.value = "NFC HCE preparado · esperando otro toque"
         } else {
