@@ -21,6 +21,7 @@ class NfcPairingReader(
         get() = adapter?.isEnabled == true
 
     fun enable(
+        onTagDetected: () -> Unit = {},
         onPayload: (String) -> Unit,
         onError: (Throwable) -> Unit,
     ) {
@@ -30,8 +31,9 @@ class NfcPairingReader(
         active.set(true)
         nfc.enableReaderMode(
             activity,
-            { tag -> readTag(tag, onPayload, onError) },
+            { tag -> readTag(tag, onTagDetected, onPayload, onError) },
             NfcAdapter.FLAG_READER_NFC_A or
+                NfcAdapter.FLAG_READER_NFC_B or
                 NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK or
                 NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS,
             null,
@@ -45,10 +47,12 @@ class NfcPairingReader(
 
     private fun readTag(
         tag: Tag,
+        onTagDetected: () -> Unit,
         onPayload: (String) -> Unit,
         onError: (Throwable) -> Unit,
     ) {
         if (!active.compareAndSet(true, false)) return
+        activity.runOnUiThread(onTagDetected)
         runCatching { adapter?.disableReaderMode(activity) }
 
         try {
