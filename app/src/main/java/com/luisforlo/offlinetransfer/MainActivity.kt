@@ -1,17 +1,20 @@
 package com.luisforlo.offlinetransfer
 
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -249,7 +252,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("0.8.2-dev · NFC estable + QR + E2E")
+                Text("0.8.3-dev · abrir archivos recibidos + NFC + E2E")
             }
 
             if (transferBusy) {
@@ -659,6 +662,19 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                 Text(it, style = MaterialTheme.typography.bodySmall)
                             }
 
+                            if (!transfer.lastReceivedUri.isNullOrBlank()) {
+                                Button(
+                                    onClick = {
+                                        activity.openReceivedFile(
+                                            transfer.lastReceivedUri,
+                                            transfer.lastReceivedMimeType,
+                                        )
+                                    },
+                                ) {
+                                    Text("Abrir archivo recibido")
+                                }
+                            }
+
                             if (transfer.phase == BackgroundTransferPhase.PAUSED) {
                                 Text(
                                     "Para continuar, reconecta por NFC o QR y selecciona el mismo archivo; el parcial se detectará automáticamente.",
@@ -673,7 +689,20 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
             if (transfer.history.isNotEmpty()) {
                 item { Text("Historial de esta sesión", style = MaterialTheme.typography.titleMedium) }
                 items(transfer.history.take(12), key = { it.id }) { entry ->
-                    Card(Modifier.fillMaxWidth()) {
+                    val canOpen = entry.direction == "RECIBIDO" && !entry.openUri.isNullOrBlank()
+                    Card(
+                        Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (canOpen) {
+                                    Modifier.clickable {
+                                        activity.openReceivedFile(entry.openUri, entry.mimeType)
+                                    }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                    ) {
                         Column(
                             Modifier.padding(14.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -681,11 +710,43 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             Text("${entry.direction} · ${entry.fileName}")
                             Text(formatBytes(entry.sizeBytes), style = MaterialTheme.typography.bodySmall)
                             Text(entry.detail, style = MaterialTheme.typography.bodySmall)
+                            if (canOpen) {
+                                Text(
+                                    "Toca para abrir",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                            }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+private fun ComponentActivity.openReceivedFile(uriString: String?, mimeType: String?) {
+    if (uriString.isNullOrBlank()) return
+    val uri = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+    val type = mimeType?.takeIf { it.isNotBlank() } ?: contentResolver.getType(uri) ?: "*/*"
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, type)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    try {
+        startActivity(intent)
+    } catch (_: ActivityNotFoundException) {
+        Toast.makeText(
+            this,
+            "No hay una app instalada para abrir este tipo de archivo.",
+            Toast.LENGTH_LONG,
+        ).show()
+    } catch (error: Throwable) {
+        Toast.makeText(
+            this,
+            "No se pudo abrir el archivo: ${error.message ?: "error desconocido"}",
+            Toast.LENGTH_LONG,
+        ).show()
     }
 }
 

@@ -320,13 +320,15 @@ class TransferForegroundService : Service() {
                                 }
                                 append("\n$diagnostics\n${saved.location}")
                             },
+                            openUri = saved.openUri.toString(),
+                            mimeType = saved.transfer.header.mimeType,
                         ),
                     )
                     refreshPartialSummary(this@TransferForegroundService)
                     updateState(
                         phase = BackgroundTransferPhase.WAITING,
                         direction = BackgroundTransferDirection.RECEIVE,
-                        message = "✓ ${saved.transfer.header.fileName} verificado. Esperando otro archivo…",
+                        message = "✓ ${saved.transfer.header.fileName} verificado. Puedes abrirlo o seguir recibiendo.",
                         bytesDone = saved.transfer.bytesTransferred,
                         bytesTotal = saved.transfer.header.sizeBytes,
                         currentFile = saved.transfer.header.fileName,
@@ -335,6 +337,8 @@ class TransferForegroundService : Service() {
                         speedBytesPerSecond = 0.0,
                         etaSeconds = null,
                         resumedFromBytes = saved.transfer.resumedFromBytes,
+                        lastReceivedUri = saved.openUri.toString(),
+                        lastReceivedMimeType = saved.transfer.header.mimeType,
                     )
                 }
             } catch (_: TransferCancelledException) {
@@ -420,6 +424,8 @@ class TransferForegroundService : Service() {
         etaSeconds: Long? = TransferRuntimeStore.state.value.etaSeconds,
         diagnostics: String? = TransferRuntimeStore.state.value.diagnostics,
         resumedFromBytes: Long = TransferRuntimeStore.state.value.resumedFromBytes,
+        lastReceivedUri: String? = TransferRuntimeStore.state.value.lastReceivedUri,
+        lastReceivedMimeType: String? = TransferRuntimeStore.state.value.lastReceivedMimeType,
     ) {
         val previous = TransferRuntimeStore.state.value
         val state = previous.copy(
@@ -437,6 +443,8 @@ class TransferForegroundService : Service() {
             encrypted = SecuritySessionStore.linkOrNull() != null || previous.encrypted,
             verificationCode = SecuritySessionStore.verificationCodeOrNull() ?: previous.verificationCode,
             resumedFromBytes = resumedFromBytes,
+            lastReceivedUri = lastReceivedUri,
+            lastReceivedMimeType = lastReceivedMimeType,
         )
         TransferRuntimeStore.set(state)
         notifyState(state)

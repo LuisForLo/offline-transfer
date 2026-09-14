@@ -8,6 +8,7 @@ import android.os.Environment
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import androidx.core.content.FileProvider
 import com.luisforlo.offlinetransfer.protocol.TransferHeader
 import com.luisforlo.offlinetransfer.security.SecuritySessionStore
 import com.luisforlo.offlinetransfer.security.SecureSessionCrypto
@@ -26,6 +27,7 @@ object AndroidFileTransfer {
     data class SavedResult(
         val transfer: TcpFileTransfer.Result,
         val location: String,
+        val openUri: Uri,
     )
 
     fun inspect(context: Context, uri: Uri): FileInfo {
@@ -145,7 +147,7 @@ object AndroidFileTransfer {
         check(result.verified) { "SHA-256 no coincide; el archivo parcial fue descartado" }
 
         val publishStartedAt = SystemClock.elapsedRealtime()
-        val location = publishVerifiedFile(
+        val published = publishVerifiedFile(
             context = context,
             source = received.destination,
             rawFileName = result.header.fileName,
@@ -159,7 +161,8 @@ object AndroidFileTransfer {
         ResumeStore.remove(context, result.header)
         return SavedResult(
             transfer = result.copy(publishElapsedMillis = publishElapsedMillis),
-            location = location,
+            location = published.location,
+            openUri = published.uri,
         )
     }
 
@@ -179,7 +182,7 @@ object AndroidFileTransfer {
             check(result.verified) { "SHA-256 no coincide; el archivo recibido fue descartado" }
 
             val publishStartedAt = SystemClock.elapsedRealtime()
-            val location = publishVerifiedFile(
+            val published = publishVerifiedFile(
                 context = context,
                 source = temporary,
                 rawFileName = result.header.fileName,
@@ -190,7 +193,8 @@ object AndroidFileTransfer {
 
             return SavedResult(
                 transfer = result.copy(publishElapsedMillis = publishElapsedMillis),
-                location = location,
+                location = published.location,
+                openUri = published.uri,
             )
         } finally {
             temporary.delete()
@@ -229,12 +233,17 @@ object AndroidFileTransfer {
         return DocumentMetadata(fileName, sizeBytes)
     }
 
+    private data class PublishedFile(
+        val location: String,
+        val uri: Uri,
+    )
+
     private fun publishVerifiedFile(
         context: Context,
         source: File,
         rawFileName: String,
         mimeType: String,
-    ): String {
+    ): PublishedFile {
         val fileName = sanitizeFileName(rawFileName)
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             publishToDownloads(context, source, fileName, mimeType)
@@ -248,7 +257,7 @@ object AndroidFileTransfer {
         source: File,
         fileName: String,
         mimeType: String,
-    ): String {
+    ): PublishedFile {
         val resolver = context.contentResolver
         val relativeDirectory = "${Environment.DIRECTORY_DOWNLOADS}/Offline Transfer"
         val values = ContentValues().apply {
@@ -272,7 +281,10 @@ object AndroidFileTransfer {
                 put(MediaStore.MediaColumns.IS_PENDING, 0)
             }
             resolver.update(destination, ready, null, null)
-            return "$relativeDirectory/$fileName"
+            return PublishedFile(
+                location = "$relativeDirectory/$fileName",
+                uri = destination,
+            )
         } catch (error: Throwable) {
             resolver.delete(destination, null, null)
             throw error
@@ -283,12 +295,20 @@ object AndroidFileTransfer {
         context: Context,
         source: File,
         fileName: String,
-    ): String {
+    ): PublishedFile {
         val root = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
         val directory = File(root, "Offline Transfer").apply { mkdirs() }
         val destination = uniqueFile(directory, fileName)
         source.copyTo(destination, overwrite = false)
-        return destination.absolutePath
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            destination,
+        )
+        return PublishedFile(
+            location = destination.absolutePath,
+            uri = uri,
+        )
     }
 
     private fun uniqueFile(directory: File, fileName: String): File {

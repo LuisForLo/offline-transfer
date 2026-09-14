@@ -26,6 +26,8 @@ data class BackgroundHistoryEntry(
     val fileName: String,
     val sizeBytes: Long,
     val detail: String,
+    val openUri: String? = null,
+    val mimeType: String? = null,
 )
 
 data class TransferRuntimeState(
@@ -43,6 +45,8 @@ data class TransferRuntimeState(
     val encrypted: Boolean = false,
     val verificationCode: String? = null,
     val resumedFromBytes: Long = 0L,
+    val lastReceivedUri: String? = null,
+    val lastReceivedMimeType: String? = null,
     val partialCount: Int = 0,
     val partialBytes: Long = 0L,
     val history: List<BackgroundHistoryEntry> = emptyList(),
