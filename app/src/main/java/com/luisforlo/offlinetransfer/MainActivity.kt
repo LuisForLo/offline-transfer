@@ -44,6 +44,7 @@ import androidx.core.content.ContextCompat
 import com.luisforlo.offlinetransfer.pairing.QrCodeGenerator
 import com.luisforlo.offlinetransfer.pairing.QrPairingPayload
 import com.luisforlo.offlinetransfer.pairing.QrScannerView
+import com.luisforlo.offlinetransfer.pairing.nfc.NfcHcePreference
 import com.luisforlo.offlinetransfer.pairing.nfc.NfcPairingReader
 import com.luisforlo.offlinetransfer.pairing.nfc.NfcPairingStore
 import com.luisforlo.offlinetransfer.transfer.background.BackgroundTransferDirection
@@ -68,6 +69,16 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        NfcHcePreference.prefer(this)
+    }
+
+    override fun onPause() {
+        NfcHcePreference.clear(this)
+        super.onPause()
+    }
 }
 
 private enum class DesiredRole {
@@ -80,6 +91,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     val activity = this
     val wifiState by wifiDirect.state.collectAsState()
     val transfer by TransferRuntimeStore.state.collectAsState()
+    val nfcHostStatus by NfcPairingStore.status.collectAsState()
 
     val nfcReader = remember { NfcPairingReader(activity) }
     val nfcSupported = remember { packageManager.hasSystemFeature(PackageManager.FEATURE_NFC) }
@@ -237,7 +249,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("0.8.0-dev · NFC + QR + segundo plano + E2E")
+                Text("0.8.1-dev · NFC reforzado + QR + E2E")
             }
 
             if (transferBusy) {
@@ -313,7 +325,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                     !nfcSupported -> Text("Este teléfono no tiene NFC. Usa el QR seguro.", style = MaterialTheme.typography.bodySmall)
                                     !hceSupported -> Text("NFC sin HCE disponible. Usa el QR seguro.", style = MaterialTheme.typography.bodySmall)
                                     !nfcReader.isEnabled -> Text("NFC está desactivado. Actívalo en Android o usa QR.", style = MaterialTheme.typography.bodySmall)
-                                    localQrPayload != null -> Text("NFC seguro listo · acerca la parte trasera del teléfono emisor.", style = MaterialTheme.typography.titleSmall)
+                                    localQrPayload != null -> Text(nfcHostStatus, style = MaterialTheme.typography.titleSmall)
                                     else -> Text("Preparando identidad para NFC…", style = MaterialTheme.typography.bodySmall)
                                 }
                                 Text("QR seguro · respaldo", style = MaterialTheme.typography.titleSmall)
@@ -354,6 +366,9 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                                 nfcReaderActive = true
                                                 runCatching {
                                                     nfcReader.enable(
+                                                        onTagDetected = {
+                                                            nfcMessage = "NFC detectado · seleccionando Offline Transfer…"
+                                                        },
                                                         onPayload = { raw -> connectFromPairingPayload(raw, "NFC") },
                                                         onError = { error ->
                                                             nfcReaderActive = false
