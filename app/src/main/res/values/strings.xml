@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="nfc_pairing_service_description">Offline Transfer NFC pairing</string>
+    <string name="nfc_pairing_aid_description">Offline Transfer secure pairing</string>
+</resources>
