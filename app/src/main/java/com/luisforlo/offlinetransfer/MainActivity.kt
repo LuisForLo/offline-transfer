@@ -30,6 +30,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -43,6 +44,8 @@ import androidx.core.content.ContextCompat
 import com.luisforlo.offlinetransfer.pairing.QrCodeGenerator
 import com.luisforlo.offlinetransfer.pairing.QrPairingPayload
 import com.luisforlo.offlinetransfer.pairing.QrScannerView
+import com.luisforlo.offlinetransfer.pairing.nfc.NfcPairingReader
+import com.luisforlo.offlinetransfer.pairing.nfc.NfcPairingStore
 import com.luisforlo.offlinetransfer.transfer.background.BackgroundTransferDirection
 import com.luisforlo.offlinetransfer.transfer.background.BackgroundTransferPhase
 import com.luisforlo.offlinetransfer.transfer.background.TransferForegroundService
@@ -78,6 +81,11 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     val wifiState by wifiDirect.state.collectAsState()
     val transfer by TransferRuntimeStore.state.collectAsState()
 
+    val nfcReader = remember { NfcPairingReader(activity) }
+    val nfcSupported = remember { packageManager.hasSystemFeature(PackageManager.FEATURE_NFC) }
+    val hceSupported = remember {
+        packageManager.hasSystemFeature(PackageManager.FEATURE_NFC_HOST_CARD_EMULATION)
+    }
     var desiredRole by remember { mutableStateOf(DesiredRole.SEND) }
     var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var nearbyPermissionGranted by remember { mutableStateOf(hasNearbyPermission()) }
@@ -85,6 +93,8 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
     var notificationPermissionGranted by remember { mutableStateOf(hasNotificationPermission()) }
     var showQrScanner by remember { mutableStateOf(false) }
     var qrMessage by remember { mutableStateOf<String?>(null) }
+    var nfcReaderActive by remember { mutableStateOf(false) }
+    var nfcMessage by remember { mutableStateOf<String?>(null) }
 
     val nearbyPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -128,6 +138,26 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         localQrPayload?.let { QrCodeGenerator.create(it.encode()) }
     }
 
+    LaunchedEffect(localQrPayload, desiredRole, wifiState.connected, hceSupported) {
+        if (
+            desiredRole == DesiredRole.RECEIVE &&
+            !wifiState.connected &&
+            hceSupported &&
+            localQrPayload != null
+        ) {
+            NfcPairingStore.publish(localQrPayload.encode())
+        } else {
+            NfcPairingStore.clear()
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            nfcReader.disable()
+            NfcPairingStore.clear()
+        }
+    }
+
     LaunchedEffect(Unit) {
         TransferForegroundService.refreshPartialSummary(activity)
         if (!nearbyPermissionGranted) {
@@ -147,8 +177,33 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
 
     val transferBusy = transfer.busy
 
+    fun stopNfcReader() {
+        nfcReader.disable()
+        nfcReaderActive = false
+    }
+
+    fun connectFromPairingPayload(raw: String, source: String) {
+        val payload = QrPairingPayload.decode(raw)
+        if (payload == null) {
+            val message = "Los datos de $source no pertenecen a Offline Transfer."
+            if (source == "NFC") nfcMessage = message else qrMessage = message
+            return
+        }
+
+        stopNfcReader()
+        showQrScanner = false
+        desiredRole = DesiredRole.SEND
+        val message = "$source de ${payload.deviceName} leído · conectando…"
+        if (source == "NFC") nfcMessage = message else qrMessage = message
+        wifiDirect.connectByAddress(
+            deviceAddress = payload.deviceAddress,
+            preferGroupOwner = false,
+        )
+    }
     fun resetAndDisconnect() {
         if (transferBusy) return
+        stopNfcReader()
+        NfcPairingStore.clear()
         selectedFiles = emptyList()
         showQrScanner = false
         qrMessage = null
@@ -163,7 +218,12 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
 
     // During an active foreground transfer the normal Android Back action closes
     // only the Activity; the service and P2P session deliberately continue.
-    BackHandler(enabled = wifiState.connected && !showQrScanner && !transferBusy) {
+    BackHandler(enabled = nfcReaderActive && !showQrScanner) {
+        stopNfcReader()
+        nfcMessage = "Emparejamiento NFC cancelado."
+    }
+
+    BackHandler(enabled = wifiState.connected && !showQrScanner && !nfcReaderActive && !transferBusy) {
         resetAndDisconnect()
     }
 
@@ -177,7 +237,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
         ) {
             item {
                 Text("Offline Transfer", style = MaterialTheme.typography.headlineMedium)
-                Text("0.7.0-dev · segundo plano + E2E + reanudación persistente")
+                Text("0.8.0-dev · NFC + QR + segundo plano + E2E")
             }
 
             if (transferBusy) {
@@ -225,11 +285,13 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
 
                                 if (desiredRole == DesiredRole.RECEIVE) {
                                     Button(onClick = {
+                                        stopNfcReader()
                                         desiredRole = DesiredRole.RECEIVE
                                         qrMessage = null
                                     }) { Text("Recibir") }
                                 } else {
                                     OutlinedButton(onClick = {
+                                        stopNfcReader()
                                         desiredRole = DesiredRole.RECEIVE
                                         qrMessage = null
                                     }) { Text("Recibir") }
@@ -246,9 +308,15 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                             verticalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
                             if (desiredRole == DesiredRole.RECEIVE) {
-                                Text("2. Muestra este QR", style = MaterialTheme.typography.titleMedium)
-                                Text("El otro teléfono debe elegir Enviar y escanearlo.")
-
+                                Text("2. Acerca los teléfonos o usa QR", style = MaterialTheme.typography.titleMedium)
+                                when {
+                                    !nfcSupported -> Text("Este teléfono no tiene NFC. Usa el QR seguro.", style = MaterialTheme.typography.bodySmall)
+                                    !hceSupported -> Text("NFC sin HCE disponible. Usa el QR seguro.", style = MaterialTheme.typography.bodySmall)
+                                    !nfcReader.isEnabled -> Text("NFC está desactivado. Actívalo en Android o usa QR.", style = MaterialTheme.typography.bodySmall)
+                                    localQrPayload != null -> Text("NFC seguro listo · acerca la parte trasera del teléfono emisor.", style = MaterialTheme.typography.titleSmall)
+                                    else -> Text("Preparando identidad para NFC…", style = MaterialTheme.typography.bodySmall)
+                                }
+                                Text("QR seguro · respaldo", style = MaterialTheme.typography.titleSmall)
                                 if (localQrBitmap != null && localQrPayload != null) {
                                     Image(
                                         bitmap = localQrBitmap.asImageBitmap(),
@@ -271,8 +339,47 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                     }
                                 }
                             } else {
-                                Text("2. Escanea el QR del receptor", style = MaterialTheme.typography.titleMedium)
-                                Text("La app identificará y conectará automáticamente al teléfono correcto.")
+                                Text("2. Empareja con el receptor", style = MaterialTheme.typography.titleMedium)
+                                Text("NFC es el método más rápido. QR sigue disponible como respaldo.")
+
+                                if (nfcSupported) {
+                                    Button(
+                                        enabled = nearbyPermissionGranted && !showQrScanner,
+                                        onClick = {
+                                            qrMessage = null
+                                            if (!nfcReader.isEnabled) {
+                                                nfcMessage = "NFC está desactivado. Actívalo en Android o usa QR."
+                                            } else {
+                                                nfcMessage = "Acerca la parte trasera de ambos teléfonos…"
+                                                nfcReaderActive = true
+                                                runCatching {
+                                                    nfcReader.enable(
+                                                        onPayload = { raw -> connectFromPairingPayload(raw, "NFC") },
+                                                        onError = { error ->
+                                                            nfcReaderActive = false
+                                                            nfcMessage = "Error NFC: ${error.message ?: error.javaClass.simpleName}"
+                                                        },
+                                                    )
+                                                }.onFailure { error ->
+                                                    nfcReaderActive = false
+                                                    nfcMessage = "Error NFC: ${error.message ?: error.javaClass.simpleName}"
+                                                }
+                                            }
+                                        },
+                                    ) { Text(if (nfcReaderActive) "NFC escuchando…" else "Emparejar por NFC") }
+
+                                    if (nfcReaderActive) {
+                                        OutlinedButton(onClick = {
+                                            stopNfcReader()
+                                            nfcMessage = "Emparejamiento NFC cancelado."
+                                        }) { Text("Cancelar NFC") }
+                                    }
+                                } else {
+                                    Text("Este teléfono no tiene NFC. Usa QR.", style = MaterialTheme.typography.bodySmall)
+                                }
+
+                                nfcMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                                Text("QR seguro · respaldo", style = MaterialTheme.typography.titleSmall)
 
                                 if (showQrScanner) {
                                     QrScannerView(
@@ -280,19 +387,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                                             .fillMaxWidth()
                                             .height(340.dp),
                                         onQrText = { raw ->
-                                            val payload = QrPairingPayload.decode(raw)
-                                            if (payload == null) {
-                                                qrMessage = "Ese QR no pertenece a Offline Transfer."
-                                                showQrScanner = false
-                                            } else {
-                                                qrMessage = "QR de ${payload.deviceName} leído · conectando…"
-                                                showQrScanner = false
-                                                desiredRole = DesiredRole.SEND
-                                                wifiDirect.connectByAddress(
-                                                    deviceAddress = payload.deviceAddress,
-                                                    preferGroupOwner = false,
-                                                )
-                                            }
+                                            connectFromPairingPayload(raw, "QR")
                                         },
                                         onError = { error ->
                                             qrMessage = "Error de cámara: ${error.message ?: error.javaClass.simpleName}"
@@ -382,7 +477,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
                 }
             }
 
-            if (wifiState.peers.isNotEmpty() && !wifiState.connected && !showQrScanner && !transferBusy) {
+            if (wifiState.peers.isNotEmpty() && !wifiState.connected && !showQrScanner && !nfcReaderActive && !transferBusy) {
                 item { Text("Dispositivos encontrados", style = MaterialTheme.typography.titleMedium) }
                 items(wifiState.peers, key = { it.deviceAddress }) { peer ->
                     Card(Modifier.fillMaxWidth()) {
@@ -548,7 +643,7 @@ private fun ComponentActivity.App(wifiDirect: WifiDirectManager) {
 
                             if (transfer.phase == BackgroundTransferPhase.PAUSED) {
                                 Text(
-                                    "Para continuar, reconecta por QR y selecciona el mismo archivo; el parcial se detectará automáticamente.",
+                                    "Para continuar, reconecta por NFC o QR y selecciona el mismo archivo; el parcial se detectará automáticamente.",
                                     style = MaterialTheme.typography.bodySmall,
                                 )
                             }
